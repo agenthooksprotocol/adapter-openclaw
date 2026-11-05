@@ -1,0 +1,8 @@
+{
+  "id": "agent-hooks-protocol",
+  "name": "Agent Hooks Protocol",
+  "description": "Delivers OpenClaw's lifecycle to Agent Hooks Protocol backends, and enforces what they decide",
+  "activation": { "onStartup": true },
+  "contracts": { "agentToolResultMiddleware": ["openclaw", "codex", "agentsapi"] },
+  "configSchema": { "type": "object", "additionalProperties": false }
+}
