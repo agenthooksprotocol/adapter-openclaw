@@ -15,6 +15,9 @@ openclaw plugins install npm:@agenthooksprotocol/adapter-openclaw --accept-capab
 openclaw config set plugins.entries.agent-hooks-protocol.hooks.allowConversationAccess true
 ```
 
+Without a terminal to confirm in (a script, CI), add `--force` to the first command: it
+acknowledges installing a package from outside ClawHub.
+
 `--accept-capabilities` consents to the plugin rewriting tool results before the model
 reads them. `allowConversationAccess` lets it see prompts and responses. Without it,
 turn and model events are left out with a warning: tool policy still holds.
