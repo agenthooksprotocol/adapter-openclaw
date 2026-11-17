@@ -34,8 +34,10 @@ export function ensureStarted(adapter: Adapter, session: SessionState, native?: 
 export function lifecycle(adapter: Adapter): void {
   const { api } = adapter;
 
-  api.on("gateway_start", () => {
+  api.on("gateway_start", (event) => {
     adapter.gateway = true;
+    // The sign-in redirect comes back to this port.
+    if (event?.port) adapter.port = event.port;
     void adapter.hooks();
   });
 

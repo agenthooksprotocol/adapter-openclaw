@@ -4,5 +4,67 @@
   "description": "Delivers OpenClaw's lifecycle to Agent Hooks Protocol backends, and enforces what they decide",
   "activation": { "onStartup": true },
   "contracts": { "agentToolResultMiddleware": ["openclaw", "codex", "agentsapi"] },
-  "configSchema": { "type": "object", "additionalProperties": false }
+  "cliCommands": [{ "name": "ahp", "description": "Agent Hooks Protocol: backend sign-in", "hasSubcommands": true }],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "oauth": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "publicUrl": { "type": "string" },
+          "loginLifetimeMs": { "type": "integer", "minimum": 1, "maximum": 600000 },
+          "allowPrivateHosts": { "type": "array", "items": { "type": "string" } },
+          "backends": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "issuer": { "type": "string" },
+                "flow": { "enum": ["authorization_code_pkce", "client_credentials"] },
+                "clientId": { "type": "string" },
+                "clientSecret": { "$ref": "#/$defs/secret" },
+                "scopes": { "type": "array", "items": { "type": "string" } },
+                "clientMetadataDocument": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["url", "redirectUris"],
+                  "properties": { "url": { "type": "string" }, "redirectUris": { "type": "array", "items": { "type": "string" } } }
+                },
+                "registration": {
+                  "oneOf": [
+                    { "type": "boolean" },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "clientName": { "type": "string" },
+                        "scopes": { "type": "array", "items": { "type": "string" } },
+                        "initialAccessToken": { "$ref": "#/$defs/secret" }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "secrets": { "type": "object", "additionalProperties": { "$ref": "#/$defs/secret" } }
+    },
+    "$defs": {
+      "secret": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "required": ["source", "id"],
+            "properties": { "source": { "enum": ["env", "file"] }, "provider": { "type": "string" }, "id": { "type": "string" } }
+          }
+        ]
+      }
+    }
+  }
 }

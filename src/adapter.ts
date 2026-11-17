@@ -4,7 +4,12 @@
 import { Hooks } from "agenthooksprotocol/client";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { capabilitiesFor, gaps, MAX_CONTINUATIONS, narrow, type Grants } from "./capabilities.js";
-import { loadRegistration } from "./config.js";
+import { join } from "node:path";
+import type { StoredRecord } from "agenthooksprotocol/oauth";
+import { loadRegistration, stateDir, type LoadedRegistration } from "./config.js";
+import { configuredPort, Logins, type PluginSettings } from "./oauth/logins.js";
+import { fileSecretStore } from "./oauth/secrets.js";
+import { keyedTokenStore, type KeyedStore } from "./oauth/store.js";
 import type { Message, NativeMessage } from "./content.js";
 import { describe, type AnyResult } from "./effects.js";
 
@@ -108,6 +113,10 @@ export class Adapter {
   readonly sessions = new Map<string, SessionState>();
   readonly #calls = new Map<string, CallState>();
   #client: Promise<Hooks | undefined> | undefined;
+  #registration: LoadedRegistration | undefined;
+  #logins: Logins | undefined;
+  /** The Gateway's port, once it has started. */
+  port: number | undefined;
   /** Deliveries under way, in every session. */
   readonly #inFlight = new Set<Promise<unknown>>();
   /** Where a tool that reports no session goes. */
@@ -121,18 +130,75 @@ export class Adapter {
 
   async #start(): Promise<Hooks | undefined> {
     try {
-      const { registration, sources, diagnostics, notes } = loadRegistration(process.env);
+      const { registration, sources, diagnostics, notes } = this.registration();
       for (const line of diagnostics) this.warn(`Agent Hooks Protocol: ${line}`);
       for (const line of notes) this.log(line);
       if (!registration) return undefined;
       const hooks = await this.#create(registration);
-      for (const issue of hooks.initializationDiagnostics ?? []) this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}`);
+      for (const issue of hooks.initializationDiagnostics ?? []) {
+        this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}${issue.auth ? ` (${issue.auth.code})` : ""}`);
+        if (issue.auth?.recovery === "login") {
+          this.#logins?.needsLogin(issue.backendId, issue.auth.requiredScopes);
+          this.#logins?.initializationFailed.add(issue.backendId);
+        }
+      }
       this.log(`delivering to ${registration.hooks.length} backend(s) from ${sources.join(", ")}`);
       return hooks;
     } catch (error) {
       this.warn(`Agent Hooks Protocol not started: ${describe(error)}`);
       return undefined;
     }
+  }
+
+  /** The registration, read once per process. */
+  registration(): LoadedRegistration {
+    return (this.#registration ??= loadRegistration(process.env));
+  }
+
+  /** Sign-in state for every backend, in OpenClaw's plugin state. Undefined where
+   * this OpenClaw cannot keep it. */
+  logins(): Logins | undefined {
+    if (this.#logins) return this.#logins;
+    try {
+      const settings = (this.api.pluginConfig ?? {}) as PluginSettings;
+      const environment = process.env;
+      const { state } = this.api.runtime;
+      const records = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth", retention: "retained" }) as unknown as KeyedStore<StoredRecord>;
+      const leases = state.openKeyedStore<string>({ namespace: "ahp-oauth-leases", maxEntries: 10_000 }) as unknown as KeyedStore<string>;
+      const directory = join(stateDir(environment) ?? state.resolveStateDir(), "plugins", PLUGIN_ID, "oauth-secrets");
+      const logins = new Logins({
+        store: keyedTokenStore(records, leases),
+        secrets: Logins.secrets(fileSecretStore(directory), settings, environment),
+        settings,
+        environment,
+        port: () => this.port ?? configuredPort(this.api.config as never, environment),
+        backends: () => (this.registration().registration?.hooks ?? []) as never,
+        log: (text) => this.log(text),
+        warn: (text) => this.warn(text),
+      });
+      // A backend skipped at initialization for want of a login gets its client back.
+      logins.onLogin = (id) => {
+        if (logins.initializationFailed.delete(id)) void this.restart();
+      };
+      return (this.#logins = logins);
+    } catch (error) {
+      this.warn(`Agent Hooks Protocol: OAuth sign-in is unavailable: ${describe(error)}`);
+      return undefined;
+    }
+  }
+
+  /** At the start of a turn: links for backends that need a sign-in, in the background. */
+  hintLogins(): void {
+    if (!this.registration().registration) return;
+    this.logins()?.hint();
+  }
+
+  /** A new client, for a registration that can now initialize in full. */
+  async restart(): Promise<void> {
+    const previous = this.#client;
+    this.#client = undefined;
+    await Promise.allSettled([...this.#inFlight]);
+    await (await previous)?.close();
   }
 
   grants(): Grants {
@@ -152,8 +218,10 @@ export class Adapter {
     const { hooks: backends, removed } = narrow(registration.hooks, offered);
     if (removed.length) this.warn(`Agent Hooks Protocol: not running ${removed.join(", ")}. Set plugins.entries.${PLUGIN_ID}.hooks.allowConversationAccess to true in openclaw.json to turn these events on.`);
     const create = async (hooks: Record<string, unknown>[]) => {
+      const logins = this.logins();
       const client = new Hooks({ ...registration, hooks } as never, {
         source: SOURCE,
+        ...(logins ? { auth: logins.provider() } : {}),
         harness: { name: "openclaw", version: this.api.runtime.version },
         capabilities: offered,
         manifestMetadata: {
@@ -281,7 +349,9 @@ export class Adapter {
     // The adapter reads no attachment back: release what the SDK kept.
     void result.content?.close().catch(() => {});
     for (const diagnostic of result.diagnostics) {
-      const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}`;
+      const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}${diagnostic.auth ? ` (${diagnostic.auth.code})` : ""}`;
+      // Shown at the next turn's start: a delivery never starts a login itself.
+      if (diagnostic.auth?.recovery === "login") this.#logins?.needsLogin(diagnostic.backendId, diagnostic.auth.requiredScopes);
       if (diagnostic.syntheticDenial) this.warn(`${line} (denied by failure policy)`);
       else this.log(line);
     }
