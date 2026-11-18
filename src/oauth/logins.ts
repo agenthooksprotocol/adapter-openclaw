@@ -104,7 +104,7 @@ export class Logins {
   readonly #publicBase: string | undefined;
   /** The Gateway's recorded redirect, read by a process that is not the Gateway. */
   #savedRedirect: string | undefined;
-  /** Backends initialization skipped for authentication: their client starts again after a login. */
+  /** Backends initialization skipped for authentication: Hooks re-attempts their configuration after a login is prepared. */
   readonly initializationFailed = new Set<string>();
   /** Hooks' listeners for prepared endpoints, fed by every backend's managed OAuth. */
   readonly #prepared = new Set<(endpoint: { backendId: string; purpose: "event" | "upload"; url: string }) => void>();
