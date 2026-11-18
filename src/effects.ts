@@ -77,7 +77,11 @@ export function eventId(result: AnyResult): string | undefined {
 }
 
 export function describe(value: unknown): string {
-  if (value instanceof Error) return value.message;
+  if (value instanceof Error) {
+    // A configuration error says where: paths and codes, no values.
+    const issues = (value as { issues?: { path: string; code: string }[] }).issues;
+    return issues?.length ? `${value.message}: ${issues.map(({ path, code }) => `${path} ${code}`).join(", ")}` : value.message;
+  }
   try {
     return JSON.stringify(value);
   } catch {

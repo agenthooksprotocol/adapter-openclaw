@@ -62,10 +62,122 @@ Omit `subscriptions` to let the backend choose them (server-driven configuration
 
 Set `AHP_HOOKS_FILE` to one registration's absolute path to use that file alone, with
 no discovery (tests, CI, a pinned deployment). Set `AHP_DEBUG=1` to log what the
-adapter loaded and each delivery diagnostic.
+adapter loaded and each delivery diagnostic, with its authentication failure code.
 
 The registration is read once, when the Gateway's first event needs it: restart the
 Gateway after changing one.
+
+## Sign in to a backend (OAuth)
+
+A backend can ask for a bearer token from an OAuth authorization server. Bearer
+bindings (`tokenEnv`, `tokenRef`) and `Authorization` headers work as before; OAuth
+needs OpenClaw 2026.10.10 or later (2026.9.36 keeps plugin state from plugins it
+does not trust, so there sign-in is unavailable and deliveries go on without it).
+
+Every backend has its own sign-in. One consent covers that backend's event and
+upload endpoints, and is never shared with another backend. A backend with a usable
+grant is never asked to sign in again.
+
+**How a sign-in happens.** A delivery never starts one. When a backend refuses a
+delivery for want of a token, or its `oauth` settings have no usable grant yet, the
+next turn prepares a sign-in in the background (the turn does not wait) and says so
+in the Gateway log, once per link:
+
+```
+Agent Hooks Protocol: sign-in needed for com.example.policy: run `openclaw ahp login com.example.policy` on the Gateway's host
+```
+
+The link itself is shown only by `openclaw ahp status` and `openclaw ahp login`, on
+the Gateway host's terminal. Not in the Gateway log, which any operator with read
+access can tail; not in a chat reply, because OpenClaw keeps those in the transcript
+the model reads, and on a shared channel others would see it too. Whoever opens a
+link binds their account to this Gateway. Repeated turns reuse the same link until
+it expires (10 minutes at most); the turn after that prepares a new one.
+
+The browser returns to the Gateway's own route, `/ahp/oauth/callback`, which
+completes the sign-in and says "You can close this tab". It needs no Gateway
+token: the OAuth state authenticates the callback.
+
+**Commands.** On the Gateway's host:
+
+```sh
+openclaw ahp status            # each backend: authorized, needs-login (with its link), client-credentials, bearer token, or failing: why
+openclaw ahp login [backend]   # print the link and wait; without a backend, every backend that needs it
+openclaw ahp complete <url>    # finish with the address the browser ended on, if it could not reach the Gateway
+openclaw ahp logout <backend>  # cancel its pending sign-in and delete its tokens
+```
+
+`openclaw ahp status` and `login` say so when the Gateway is not running, since a
+link returns to it. `openclaw ahp login` on a terminal also accepts that address
+pasted in. In chat, the
+owner's `/ahp status`, `/ahp login [backend]` and `/ahp logout <backend>` do the same,
+without ever putting a link in the reply: `/ahp login` prepares the sign-in and points
+at `openclaw ahp login`.
+
+Without a person (CI, `openclaw agent --local` in a script), the hint is only
+logged, and a failure to prepare one is warned of once per backend and reason: use
+client credentials. `openclaw agent exec` runs with a temporary state
+directory, so it has no sign-in of the Gateway's: use client credentials, or
+`--state-dir` to share the Gateway's.
+
+### Settings
+
+A backend's OAuth settings are an `oauth` object on its entry in `hooks.json`. The
+same names mean the same in every AHP adapter, so one `~/.agents/hooks.json` serves
+them all:
+
+```json
+{
+  "id": "com.example.policy",
+  "transport": { "type": "http", "url": "https://hooks.example/ahp" },
+  "oauth": { "issuer": "https://auth.example", "registration": true, "scopes": ["hooks"] }
+}
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `issuer` | The authorization server trusted for this backend (or the `authentication` preset's). A backend's advertisement never chooses one by itself. Client credentials and client secrets always need it. |
+| `trustAdvertisedIssuer` | Without `issuer`, trust the one issuer the backend advertises, for a public browser sign-in only. Default `false`. |
+| `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
+| `scopes` | Scopes to request. |
+| `clientId` | A client registered in advance. It always wins. |
+| `clientSecretRef` | A key in the plugin config's `secrets`. |
+| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document you publish, used where the issuer supports them. `redirectUris` must include the Gateway's callback. The adapter publishes none of its own: a document lists exact redirects, and each Gateway's differs. |
+| `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. |
+| `redirectPort` | Not used by OpenClaw: the callback is the Gateway's route, on the Gateway's port. |
+| `loginLifetimeMinutes` | How long a sign-in link lasts, up to 10 (the default). |
+| `allowPrivateNetwork` | Allow the authorization server on loopback or private addresses. Default `false`. |
+
+The registration's own `oauth` preset (`issuer`, `resource`, `clientId`, `flow`,
+`scopes`, `clientSecretRef`) works too; the `oauth` object's settings take
+precedence. OAuth requests go only to HTTPS endpoints, follow no redirects, and
+connect only to public addresses (unless `allowPrivateNetwork`).
+
+What is OpenClaw's alone goes in the plugin config,
+`plugins.entries.agent-hooks-protocol.config`:
+
+| Setting | Meaning |
+| --- | --- |
+| `publicUrl` | The Gateway as a browser reaches it, behind a proxy or Tailscale: HTTPS, or HTTP on a loopback address, with no credentials, query or fragment (otherwise it is ignored with a warning). A path prefix is kept, for a proxy that strips it: the redirect is `<publicUrl>/ahp/oauth/callback`. By default it is `http://127.0.0.1:<gateway port>/ahp/oauth/callback`. |
+| `secrets` | `{ "<ref>": <secret> }` for `tokenRef`, `clientSecretRef` and `initialAccessTokenRef`. A secret is a string, or a SecretRef `{ "source": "env", "provider": "default", "id": "NAME" }` or `{ "source": "file", "provider": "…", "id": "/path" }`. |
+
+The redirect stays the same for each grant. The Gateway records the one it answers
+on (its live port, whatever `--port` it was started with) in plugin state, and
+`openclaw ahp` uses that one; before a Gateway has run, it uses `gateway.port`.
+
+### Where credentials live
+
+- Tokens, refresh tokens, pending sign-ins, discovery results and registered client
+  ids: OpenClaw's plugin state (the `ahp-oauth` namespace of its state database under
+  `~/.openclaw`, or `$OPENCLAW_STATE_DIR`), shared by the Gateway and `openclaw ahp`.
+  A short-lived lease row (`ahp-oauth-leases`), renewed atomically while held, keeps
+  the two from refreshing or completing the same grant at once; a holder that loses
+  its lease says so in the log, and its writes still go through only where the record's
+generation is unchanged. The Gateway's redirect is in `ahp-oauth-gateway`.
+- Client secrets that a registration issued: OpenClaw has no secret store a plugin
+  can write, so each is a file of its own, mode `0600`, in
+  `<state dir>/plugins/agent-hooks-protocol/oauth-secrets/` (mode `0700`), apart from
+  the tokens. Secrets you configure stay in the plugin config's `secrets`.
 
 ## What it covers
 
@@ -138,4 +250,5 @@ npm run check   # typecheck, unit tests, end-to-end tests on both OpenClaw versi
 
 The end-to-end tests need Node 24 and bun. They install the packed plugin into a real
 Gateway under a temporary home, with a local fake model, a recording backend and a
-recording channel. Nothing reaches a real provider or backend.
+recording channel, and for sign-in a fake OAuth authorization server over HTTPS
+with a throwaway CA (they need `openssl`). Nothing reaches a real provider or backend.

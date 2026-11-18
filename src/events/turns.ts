@@ -37,6 +37,8 @@ export function begin(adapter: Adapter, ctx: RunScope, prompt: string | undefine
     started: Promise.resolve(),
   };
   session.turn = turn;
+  // Never awaited: a turn does not wait on a sign-in.
+  adapter.hintLogins();
   turn.started = (async () => {
     // Another plugin claimed the last run before it began: no agent_end is coming.
     if (previous && !previous.ended) await endTurn(adapter, previous, "completed");

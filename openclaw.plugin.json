@@ -2,7 +2,66 @@
   "id": "agent-hooks-protocol",
   "name": "Agent Hooks Protocol",
   "description": "Delivers OpenClaw's lifecycle to Agent Hooks Protocol backends, and enforces what they decide",
-  "activation": { "onStartup": true },
-  "contracts": { "agentToolResultMiddleware": ["openclaw", "codex", "agentsapi"] },
-  "configSchema": { "type": "object", "additionalProperties": false }
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "agentToolResultMiddleware": [
+      "openclaw",
+      "codex",
+      "agentsapi"
+    ]
+  },
+  "cliCommands": [
+    {
+      "name": "ahp",
+      "description": "Agent Hooks Protocol: backend sign-in",
+      "hasSubcommands": true
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "publicUrl": {
+        "type": "string"
+      },
+      "secrets": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/$defs/secret"
+        }
+      }
+    },
+    "$defs": {
+      "secret": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "required": [
+              "source",
+              "id"
+            ],
+            "properties": {
+              "source": {
+                "enum": [
+                  "env",
+                  "file"
+                ]
+              },
+              "provider": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
 }
