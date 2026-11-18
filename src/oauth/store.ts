@@ -59,25 +59,42 @@ export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: Keyed
   /** Leases this process holds, by stored key. A lost one commits nothing more. */
   const held = new Map<string, { token: string; lost: boolean }>();
 
-  /** Extend the lease only while it is still this holder's, in one compare-and-apply. */
+  /** A lease another holder has taken: said once. The work still commits where the
+   * record's generation is unchanged (compareAndSet checks it), so a refresh token the
+   * server has already rotated is never thrown away. */
+  function lost(lease: { token: string; lost: boolean }): void {
+    if (lease.lost) return;
+    lease.lost = true;
+    options.warn?.("Agent Hooks Protocol: an OAuth lock expired or was taken while held");
+  }
+
+  /** Extend the lease only while it is still this holder's, in one compare-and-apply.
+   * A storage error is tried again at the next renewal: it does not lose the lease. */
   async function renew(key: string, lease: { token: string; lost: boolean }): Promise<void> {
+    let seen: { value: string | undefined; comparison: string };
     try {
-      const seen = await observeLease(key);
-      if (seen.value !== lease.token) throw new Error("taken");
-      const result = await applyLease(key, seen.comparison, { operation: "update", action: "set", value: lease.token, ttlMs: leaseMs });
-      if (result.status === "conflict") throw new Error("taken");
+      seen = await observeLease(key);
     } catch {
-      if (!lease.lost) options.warn?.("Agent Hooks Protocol: an OAuth lock was lost while held; its work commits nothing more");
-      lease.lost = true;
+      return;
+    }
+    if (seen.value !== lease.token) return lost(lease);
+    try {
+      const result = await applyLease(key, seen.comparison, { operation: "update", action: "set", value: lease.token, ttlMs: leaseMs });
+      if (result.status === "conflict" && result.current.value !== lease.token) lost(lease);
+    } catch {
+      // Tried again at the next renewal.
     }
   }
 
-  /** Before a write under a lease: is it still this holder's? */
-  async function stillHeld(key: string): Promise<boolean> {
+  /** Before a write under a lease: warn if another holder has it. */
+  async function checkHeld(key: string): Promise<void> {
     const lease = held.get(key);
-    if (!lease) return true;
-    if (!lease.lost && (await leases.lookup(key)) !== lease.token) lease.lost = true;
-    return !lease.lost;
+    if (!lease || lease.lost) return;
+    try {
+      if ((await leases.lookup(key)) !== lease.token) lost(lease);
+    } catch {
+      // The generation check below still guards the write.
+    }
   }
 
   async function acquire(key: string, token: string, signal: AbortSignal): Promise<void> {
@@ -106,8 +123,8 @@ export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: Keyed
         const seen = await observe(stored);
         if (seen.value?.generation !== expected) return false;
         signal.throwIfAborted();
-        // A holder whose lease expired or was taken must not overwrite the new holder's work.
-        if (!(await stillHeld(stored))) return false;
+        // The generation, not the lease, decides: a newer holder's write changes it.
+        await checkHeld(stored);
         const result = await apply(stored, seen.comparison, value !== undefined
           ? { operation: "update", action: "set", value }
           : seen.value === undefined ? { operation: "delete", action: "keep" } : { operation: "delete", action: "delete" });

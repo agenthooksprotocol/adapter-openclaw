@@ -106,11 +106,14 @@ export function cliCommands(program: Command, gateway: () => Logins, backends: (
   const logins = () => (loaded ??= (async () => { const current = gateway(); await current.loadRedirect().catch(() => {}); return current; })());
   const ahp = program.command("ahp").description("Agent Hooks Protocol: backend sign-in");
   ahp.command("status").description("How each backend in hooks.json authenticates").action(async () => {
-    console.log(await statusLines(await logins(), backends(), true));
+    const current = await logins();
+    await warnIfStopped(current);
+    console.log(await statusLines(current, backends(), true));
   });
   ahp.command("login").argument("[backend]", "a backend id; without one, every backend that needs it")
     .description("Sign in to a backend, in a browser").action(async (id?: string) => {
       const current = await logins();
+      await warnIfStopped(current);
       const targets = id ? [{ id }] : await current.waiting();
       if (!targets.length) return console.log("No backend needs a sign-in.");
       let failed = false;
@@ -135,6 +138,24 @@ export function cliCommands(program: Command, gateway: () => Logins, backends: (
   ahp.command("logout").argument("<backend>").description("Cancel a backend's sign-in and delete its tokens").action(async (id: string) => {
     console.log((await (await logins()).logout(id)) ? `${id}: signed out` : `${id}: was not signed in`);
   });
+}
+
+/** Whether something answers at the redirect: the Gateway, if it is running. */
+export async function gatewayRunning(redirectUri: string, timeoutMs = 2000): Promise<boolean> {
+  try {
+    await fetch(redirectUri, { signal: AbortSignal.timeout(timeoutMs), redirect: "manual" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** For `openclaw ahp`: links name the Gateway's last redirect, which a Gateway
+ * started on another port would not answer. */
+async function warnIfStopped(logins: Logins): Promise<void> {
+  if (!(await gatewayRunning(logins.redirectUri))) {
+    console.log(`The Gateway is not running at ${new URL(logins.redirectUri).origin}: a sign-in link returns there, so start the Gateway (or finish with \`openclaw ahp complete <url>\`). If it now runs on another port, its first start records the new one.`);
+  }
 }
 
 /** Until the Gateway (or a pasted address, on a terminal) completes the login. */

@@ -107,7 +107,9 @@ openclaw ahp complete <url>    # finish with the address the browser ended on, i
 openclaw ahp logout <backend>  # cancel its pending sign-in and delete its tokens
 ```
 
-`openclaw ahp login` on a terminal also accepts that address pasted in. In chat, the
+`openclaw ahp status` and `login` say so when the Gateway is not running, since a
+link returns to it. `openclaw ahp login` on a terminal also accepts that address
+pasted in. In chat, the
 owner's `/ahp status`, `/ahp login [backend]` and `/ahp logout <backend>` do the same,
 without ever putting a link in the reply: `/ahp login` prepares the sign-in and points
 at `openclaw ahp login`.
@@ -170,7 +172,8 @@ on (its live port, whatever `--port` it was started with) in plugin state, and
   `~/.openclaw`, or `$OPENCLAW_STATE_DIR`), shared by the Gateway and `openclaw ahp`.
   A short-lived lease row (`ahp-oauth-leases`), renewed atomically while held, keeps
   the two from refreshing or completing the same grant at once; a holder that loses
-  its lease writes nothing more. The Gateway's redirect is in `ahp-oauth-gateway`.
+  its lease says so in the log, and its writes still go through only where the record's
+generation is unchanged. The Gateway's redirect is in `ahp-oauth-gateway`.
 - Client secrets that a registration issued: OpenClaw has no secret store a plugin
   can write, so each is a file of its own, mode `0600`, in
   `<state dir>/plugins/agent-hooks-protocol/oauth-secrets/` (mode `0700`), apart from

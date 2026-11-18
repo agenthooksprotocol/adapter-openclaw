@@ -10,7 +10,7 @@ import { privateAddress } from "../../src/oauth/network";
 import { fileSecretStore, resolveSecret } from "../../src/oauth/secrets";
 import { backendSettings, trustedIssuer } from "../../src/oauth/settings";
 import { keyedTokenStore, type KeyedStore } from "../../src/oauth/store";
-import { callbackRoute } from "../../src/oauth/surfaces";
+import { callbackRoute, gatewayRunning } from "../../src/oauth/surfaces";
 
 const dir = mkdtempSync(join(tmpdir(), "ahp-openclaw-oauth-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -40,12 +40,22 @@ class Table<T> implements KeyedStore<T> {
     if (this.#live(key)?.value !== expected) return false;
     return this.rows.delete(key);
   }
+  /** Runs between an observation and what follows it: another process acting. */
+  afterObserve?: (key: string) => void;
+  /** The next compare-and-apply fails as busy storage would. */
+  failNextApply = false;
   async observe(key: string) {
     const row = this.#live(key);
+    queueMicrotask(() => this.afterObserve?.(key));
     return { value: row?.value, comparison: String(row?.version ?? "absent") };
   }
   async compareAndApply(key: string, comparison: string, intent: { action: string; value?: T; ttlMs?: number }) {
-    const current = await this.observe(key);
+    if (this.failNextApply) {
+      this.failNextApply = false;
+      throw new Error("database is locked");
+    }
+    const row = this.#live(key);
+    const current = { value: row?.value, comparison: String(row?.version ?? "absent") };
     if (current.comparison !== comparison) return { status: "conflict" as const, current };
     if (intent.action === "set") this.#set(key, intent.value as T, intent.ttlMs);
     else if (intent.action === "delete") this.rows.delete(key);
@@ -116,7 +126,7 @@ describe("the token store", () => {
 });
 
 describe("lease loss", () => {
-  test("a holder whose lease was taken commits nothing, and says so", async () => {
+  test("a holder whose lease was taken says so, and still commits a generation nobody changed", async () => {
     const records = new Table<StoredRecord>(), leases = new Table<string>();
     const warnings: string[] = [];
     const store = keyedTokenStore(records, leases, { leaseMs: 90, warn: (text) => warnings.push(text) });
@@ -126,12 +136,49 @@ describe("lease loss", () => {
       const lease = [...leases.rows.keys()][0]!;
       leases.rows.set(lease, { value: "someone else", version: 999 });
       await Bun.sleep(80);
+      // A rotated refresh token is kept: the generation, not the lease, guards it.
       return store.compareAndSet(key, undefined, grant("late"), signal());
     });
-    expect(result).toBe(false);
-    expect(await store.load(key, signal())).toBeUndefined();
+    expect(result).toBe(true);
+    expect((await store.load(key, signal()))?.generation).toBe("late");
     expect(warnings).toHaveLength(1);
     // The other holder's lease is not released by the one that lost it.
+    expect([...leases.rows.values()][0]?.value).toBe("someone else");
+  });
+
+  test("a renewal that fails on busy storage loses nothing", async () => {
+    const records = new Table<StoredRecord>(), leases = new Table<string>();
+    const warnings: string[] = [];
+    const store = keyedTokenStore(records, leases, { leaseMs: 90, warn: (text) => warnings.push(text) });
+    const key = "ahp.oauth.grant:busy";
+    leases.failNextApply = true;
+    const written = await store.coordinate(key, signal(), async () => {
+      await Bun.sleep(200);
+      expect(leases.failNextApply).toBe(false);
+      // Renewed after the failure: still this holder's.
+      expect([...leases.rows.values()][0]?.value).not.toBe("someone else");
+      return store.compareAndSet(key, undefined, grant("1"), signal());
+    });
+    expect(written).toBe(true);
+    expect(warnings).toEqual([]);
+  });
+
+  test("renewal is one compare-and-apply: a lease taken in between is not overwritten, and is noticed at once", async () => {
+    const records = new Table<StoredRecord>(), leases = new Table<string>();
+    const warnings: string[] = [];
+    const store = keyedTokenStore(records, leases, { leaseMs: 90, warn: (text) => warnings.push(text) });
+    let stolen = false;
+    leases.afterObserve = (key) => {
+      if (stolen) return;
+      stolen = true;
+      leases.rows.set(key, { value: "someone else", version: 999 });
+    };
+    await store.coordinate("ahp.oauth.grant:race", signal(), async () => {
+      // The first renewal runs at 30ms; the next would not before 60ms.
+      await Bun.sleep(45);
+      expect(warnings).toHaveLength(1);
+    });
+    expect(stolen).toBe(true);
     expect([...leases.rows.values()][0]?.value).toBe("someone else");
   });
 
@@ -395,5 +442,17 @@ describe("logins", () => {
     instance.show("a", "https://as.example/authorize?state=secret");
     instance.show("a", "https://as.example/authorize?state=next");
     expect(warnings).toEqual(Array(2).fill("Agent Hooks Protocol: sign-in needed for a: run `openclaw ahp login a` on the Gateway's host"));
+  });
+});
+
+describe("openclaw ahp", () => {
+  test("knows whether the Gateway answers at the redirect", async () => {
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("not signed in", { status: 400 }) });
+    try {
+      expect(await gatewayRunning(`http://127.0.0.1:${server.port}/ahp/oauth/callback`)).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+    expect(await gatewayRunning(`http://127.0.0.1:${server.port}/ahp/oauth/callback`, 500)).toBe(false);
   });
 });
