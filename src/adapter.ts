@@ -115,6 +115,8 @@ export class Adapter {
   #client: Promise<Hooks | undefined> | undefined;
   #registration: LoadedRegistration | undefined;
   #logins: Logins | undefined;
+  /** Sign-in could not start here: said once. */
+  #loginsUnavailable = false;
   /** The Gateway's port, once it has started. */
   port: number | undefined;
   /** Deliveries under way, in every session. */
@@ -158,7 +160,7 @@ export class Adapter {
   /** Sign-in state for every backend, in OpenClaw's plugin state. Undefined where
    * this OpenClaw cannot keep it. */
   logins(): Logins | undefined {
-    if (this.#logins) return this.#logins;
+    if (this.#logins || this.#loginsUnavailable) return this.#logins;
     try {
       const settings = (this.api.pluginConfig ?? {}) as PluginSettings;
       const environment = process.env;
@@ -182,6 +184,7 @@ export class Adapter {
       };
       return (this.#logins = logins);
     } catch (error) {
+      this.#loginsUnavailable = true;
       this.warn(`Agent Hooks Protocol: OAuth sign-in is unavailable: ${describe(error)}`);
       return undefined;
     }
