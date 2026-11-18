@@ -10,8 +10,9 @@
 // binds their account to this Gateway.
 import { auth, AuthError, type DeliveryAuthContext, type DeliveryAuthProvider } from "agenthooksprotocol/client";
 import { bindingKey, frame, managedOAuth, type ClientConfig, type PendingLogin, type SecretStore, type StoredRecord, type TokenStore } from "agenthooksprotocol/oauth";
-import { allowHosts, checkDestination, policyFetch } from "./network.js";
+import { checkDestination, policyFetch } from "./network.js";
 import { resolveSecret } from "./secrets.js";
+import { backendSettings, trustedIssuer, type BackendSettings } from "./settings.js";
 
 export const CALLBACK_PATH = "/ahp/oauth/callback";
 export const NAMESPACE = "openclaw";
@@ -19,34 +20,13 @@ const DEFAULT_PORT = 18789;
 const PREPARE_MS = 120_000;
 const DELIVERY_MS = 30_000;
 
-/** `plugins.entries.agent-hooks-protocol.config.oauth.backends.<id>` */
-export interface BackendClient {
-  /** The authorization server this backend may use. Required: metadata never chooses one. */
-  issuer?: string;
-  flow?: "authorization_code_pkce" | "client_credentials";
-  /** A pre-registered client. It always wins over a metadata document or registration. */
-  clientId?: string;
-  clientSecret?: unknown;
-  scopes?: string[];
-  /** A Client ID Metadata Document this operator publishes: its URL is the client id. */
-  clientMetadataDocument?: { url: string; redirectUris: string[] };
-  /** Permission to register a client dynamically at `issuer`. */
-  registration?: boolean | { clientName?: string; scopes?: string[]; initialAccessToken?: unknown };
-}
-
-export interface OAuthSettings {
+/** `plugins.entries.agent-hooks-protocol.config`: what is OpenClaw's alone. A
+ * backend's OAuth settings are its `oauth` object in hooks.json, as for every harness. */
+export interface PluginSettings {
   /** The Gateway as a browser reaches it, when not at 127.0.0.1 (a proxy, Tailscale). */
   publicUrl?: string;
-  /** How long a sign-in link stays valid, at most 10 minutes. */
-  loginLifetimeMs?: number;
-  /** Hosts OAuth may reach at a private or loopback address. */
-  allowPrivateHosts?: string[];
-  backends?: Record<string, BackendClient>;
-}
-
-export interface PluginSettings {
-  oauth?: OAuthSettings;
-  /** Values for `tokenRef` and `clientSecretRef` in hooks.json, by reference. */
+  /** Values for `tokenRef`, `clientSecretRef` and `initialAccessTokenRef`, by reference:
+   * a literal, or an OpenClaw SecretRef to an environment variable or a file. */
   secrets?: Record<string, unknown>;
 }
 
@@ -92,8 +72,9 @@ const describe = (error: unknown) => error instanceof AuthError ? error.code : e
 
 export class Logins {
   readonly #host: LoginHost;
-  readonly oauth: ReturnType<typeof managedOAuth>;
-  readonly #route: DeliveryAuthProvider;
+  /** One managed OAuth per backend, for its own lifetime and network settings. All
+   * share one store and namespace. */
+  readonly #backends = new Map<string, { settings: BackendSettings; oauth: ReturnType<typeof managedOAuth>; route: DeliveryAuthProvider }>();
   /** Backends a delivery or initialization said need a login, with the scopes it asked for. */
   readonly #needed = new Map<string, readonly string[] | undefined>();
   /** The last link logged for a backend: repeated turns show the same one once. */
@@ -105,25 +86,40 @@ export class Logins {
 
   constructor(host: LoginHost) {
     this.#host = host;
-    const oauth = host.settings.oauth ?? {};
-    const allowed = allowHosts(oauth.allowPrivateHosts);
-    this.oauth = managedOAuth({
+  }
+
+  /** A backend's settings and managed OAuth; problems with its `oauth` are warned once. */
+  #for(id: string) {
+    let entry = this.#backends.get(id);
+    if (entry) return entry;
+    const backend = this.backend(id) ?? { id };
+    const { settings, problems } = backendSettings(backend);
+    for (const problem of problems) this.#host.warn(`Agent Hooks Protocol: ${problem}`);
+    const oauth = managedOAuth({
       namespace: NAMESPACE,
-      store: host.store,
-      secrets: host.secrets,
-      policyFetch: policyFetch(allowed),
-      checkDestination: checkDestination(allowed),
+      store: this.#host.store,
+      secrets: this.#host.secrets,
+      policyFetch: policyFetch(settings.allowPrivateNetwork),
+      checkDestination: checkDestination(settings.allowPrivateNetwork),
       selectClient: (issuers, resource, context, operation) => {
         operation.signal.throwIfAborted();
         return this.selectClient(issuers, resource, context);
       },
-      ...(oauth.loginLifetimeMs ? { loginLifetimeMs: oauth.loginLifetimeMs } : {}),
+      loginLifetimeMs: settings.loginLifetimeMs,
     });
-    this.#route = this.oauth.provider({ budget: (context) => budget(DELIVERY_MS, context.signal) });
+    entry = { settings, oauth, route: oauth.provider({ budget: (context) => budget(DELIVERY_MS, context.signal) }) };
+    this.#backends.set(id, entry);
+    return entry;
   }
 
+  /** Routes each delivery to its own backend's managed OAuth. */
+  readonly #route: DeliveryAuthProvider = {
+    credential: (context) => this.#for(context.backendId).route.credential(context),
+    challenge: (context) => this.#for(context.backendId).route.challenge(context),
+  };
+
   get redirectUri(): string {
-    const base = this.#host.settings.oauth?.publicUrl;
+    const base = this.#host.settings.publicUrl;
     return base ? new URL(CALLBACK_PATH, base).href : `http://127.0.0.1:${this.#host.port()}${CALLBACK_PATH}`;
   }
 
@@ -137,48 +133,58 @@ export class Logins {
     return auth.compose({ bearer: auth.bearer({ resolveCredentialReference }), oauth: this.#route, discover: this.#route });
   }
 
-  /** Local trust policy: only a backend this operator configured, at the issuer they named. */
+  /** Local trust policy: only a backend the operator set up for OAuth, at the issuer
+   * they named. The `oauth` object's settings take precedence over the preset's. */
   selectClient(issuers: readonly string[], resource: string, context: DeliveryAuthContext): ClientConfig {
-    const entry = this.#host.settings.oauth?.backends?.[context.backendId];
+    const settings = this.#for(context.backendId).settings;
     const preset = context.authentication?.type === "oauth" ? context.authentication : undefined;
-    if (!entry && !preset) throw new AuthError("access_denied");
-    const issuer = preset?.issuer ?? entry?.issuer;
-    if (!issuer || !issuers.includes(issuer)) throw new AuthError("access_denied");
-    const flow = (preset?.flow ?? entry?.flow ?? "authorization_code_pkce") as ClientConfig["flow"];
-    const clientId = preset?.clientId ?? entry?.clientId;
-    const secret = preset?.clientSecretRef !== undefined ? this.resolveReference(preset.clientSecretRef) : resolveSecret(entry?.clientSecret, this.#host.environment);
-    const registration = entry?.registration === true ? {} : object(entry?.registration) ? entry.registration : undefined;
+    if (!settings.configured && !preset) throw new AuthError("access_denied");
+    const flow = (settings.flow ?? preset?.flow ?? "authorization_code_pkce") as ClientConfig["flow"];
+    const clientId = settings.clientId ?? preset?.clientId;
+    const secretRef = settings.clientSecretRef ?? preset?.clientSecretRef;
+    const issuer = trustedIssuer({
+      configured: settings.issuer ?? preset?.issuer,
+      trustAdvertised: settings.trustAdvertisedIssuer,
+      flow,
+      confidential: secretRef !== undefined || flow === "client_credentials",
+      advertised: issuers,
+    });
+    if (!issuer) throw new AuthError("access_denied");
+    const secret = secretRef === undefined ? undefined : this.resolveReference(secretRef);
+    // A named secret that does not resolve is not a public client.
+    if (secretRef !== undefined && secret === undefined) throw new AuthError("credential_unavailable");
+    const registration = settings.registration;
     return {
       issuer,
       resource: preset?.resource ?? resource,
       flow,
-      scopes: entry?.scopes ?? preset?.scopes ?? [],
+      scopes: settings.scopes ?? preset?.scopes ?? [],
       // One consent per backend, for its event and upload endpoints alike.
       grantPartition: context.backendId,
       ...(clientId ? { clientId } : {}),
       ...(secret ? { clientSecret: secret } : {}),
       ...(flow === "authorization_code_pkce" ? { redirectUri: this.redirectUri } : {}),
-      ...(entry?.clientMetadataDocument ? { clientMetadataDocument: entry.clientMetadataDocument } : {}),
+      ...(settings.clientMetadataDocument ? { clientMetadataDocument: settings.clientMetadataDocument } : {}),
       ...(registration ? {
         registration: {
           clientName: registration.clientName ?? "OpenClaw (Agent Hooks Protocol)",
           softwareId: "@agenthooksprotocol/adapter-openclaw",
           ...(registration.scopes ? { scopes: registration.scopes } : {}),
-          ...(registration.initialAccessToken !== undefined ? { initialAccessTokenRef: `config:${context.backendId}` } : {}),
+          ...(registration.initialAccessTokenRef ? { initialAccessTokenRef: registration.initialAccessTokenRef } : {}),
         },
       } : {}),
     };
   }
 
-  /** The secret hook: issued secrets in their files, an initial access token from config. */
+  /** The secret hook: the operator's references from plugin config, and issued
+   * secrets in their own files. */
   static secrets(files: SecretStore, settings: PluginSettings, environment: Record<string, string | undefined>): SecretStore {
     return {
       put: (reference, secret, signal) => files.put(reference, secret, signal),
-      delete: (reference, signal) => reference.startsWith("config:") ? Promise.resolve() : files.delete(reference, signal),
+      delete: (reference, signal) => files.delete(reference, signal),
       async get(reference, signal) {
-        if (!reference.startsWith("config:")) return files.get(reference, signal);
-        const registration = settings.oauth?.backends?.[reference.slice("config:".length)]?.registration;
-        return object(registration) ? resolveSecret(registration.initialAccessToken, environment) : undefined;
+        const configured = settings.secrets?.[reference];
+        return configured !== undefined ? resolveSecret(configured, environment) : files.get(reference, signal);
       },
     };
   }
@@ -205,9 +211,9 @@ export class Logins {
     const headers = (backend.transport as { headers?: Record<string, unknown> }).headers ?? {};
     const binding = backend.authentication as { type?: string; flow?: string } | undefined;
     if (binding?.type === "bearer" || Object.keys(headers).some((name) => name.toLowerCase() === "authorization")) return "bearer";
-    const entry = this.#host.settings.oauth?.backends?.[backend.id];
-    if (binding?.type === "oauth" || entry) {
-      return (binding?.flow ?? entry?.flow) === "client_credentials" ? "client-credentials" : "login";
+    const settings = this.#for(backend.id).settings;
+    if (binding?.type === "oauth" || settings.configured) {
+      return (settings.flow ?? binding?.flow) === "client_credentials" ? "client-credentials" : "login";
     }
     return "none";
   }
@@ -239,7 +245,7 @@ export class Logins {
     } catch (error) {
       if (!(error instanceof AuthError) || error.recovery !== "login") return { state: "failing", reason: describe(error) };
     }
-    if (kind === "none") return { state: "failing", reason: "it asks for OAuth, and no client is configured for it" };
+    if (kind === "none") return { state: "failing", reason: "it asks for OAuth: give it an `oauth` object in hooks.json" };
     const pending = await this.pending(context).catch(() => undefined);
     return { state: "needs-login", ...(pending ? { url: pending.authorizationUrl, expiresAt: pending.expiresAt } : {}) };
   }
@@ -250,7 +256,7 @@ export class Logins {
     const context = backend && this.context(backend);
     if (!context) throw new Error(`${backendId} is not an HTTP backend in hooks.json`);
     const requiredScopes = this.#needed.get(backendId);
-    const result = await this.oauth.prepare(context, budget(PREPARE_MS), requiredScopes ? { requiredScopes } : {});
+    const result = await this.#for(backendId).oauth.prepare(context, budget(PREPARE_MS), requiredScopes ? { requiredScopes } : {});
     if (result.type === "ready") {
       this.#ready(backendId);
       return { type: "ready" };
@@ -279,6 +285,7 @@ export class Logins {
       this.#checking.add(backend.id);
       void (async () => {
         if ((await this.status(backend)).state !== "needs-login") return this.#ready(backend.id);
+        this.#host.log(`${backend.id}: preparing a sign-in`);
         const result = await this.login(backend.id);
         if (result.type === "pending") this.show(backend.id, result.url, result.expiresAt);
       })().catch((error) => this.#host.log(`${backend.id}: sign-in not prepared (${describe(error)})`)).finally(() => this.#checking.delete(backend.id));
@@ -307,7 +314,7 @@ export class Logins {
         const pending = context && await this.pending(context);
         if (!pending || pending.state !== state) continue;
         const { state: _state, ...handle } = pending;
-        await this.oauth.complete(handle, callback, budget(DELIVERY_MS));
+        await this.#for(backend.id).oauth.complete(handle, callback, budget(DELIVERY_MS));
         this.#ready(backend.id);
         this.onLogin?.(backend.id);
         return backend.id;
@@ -326,7 +333,7 @@ export class Logins {
     const pending = await this.pending(context);
     if (pending) {
       const { state: _state, ...handle } = pending;
-      await this.oauth.cancel(handle, operation);
+      await this.#for(backendId).oauth.cancel(handle, operation);
     }
     const store = this.#host.store;
     const binding = await store.load(bindingKey(NAMESPACE, context), operation.signal);

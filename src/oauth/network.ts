@@ -1,6 +1,6 @@
 // OAuth's own network access: discovery, registration and token requests. HTTPS
 // only, no redirects followed, a bounded body, and no private or loopback address
-// unless the operator names the host. The check runs on the address the
+// unless the backend's `oauth.allowPrivateNetwork` permits it. The check runs on the address the
 // connection uses, so a name that resolves elsewhere later is checked again.
 import { lookup as resolve, type LookupAddress } from "node:dns";
 import { isIP } from "node:net";
@@ -23,12 +23,17 @@ export function privateAddress(address: string): boolean {
   return lower === "::" || lower === "::1" || /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower) || /^ff/.test(lower);
 }
 
-export type HostPolicy = (hostname: string) => boolean;
+/** Names that mean this machine or its local network, whatever they resolve to. */
+function localName(host: string): boolean {
+  const name = host.toLowerCase().replace(/\.$/, "");
+  return name === "localhost" || name.endsWith(".localhost") || name.endsWith(".local") || name.endsWith(".internal");
+}
 
-/** The operator's exceptions, by host name or address literal. */
-export function allowHosts(hosts: readonly string[] = []): HostPolicy {
-  const allowed = new Set(hosts.map((host) => host.toLowerCase().replace(/^\[|\]$/g, "")));
-  return (hostname) => allowed.has(hostname.toLowerCase().replace(/^\[|\]$/g, ""));
+/** Whether a URL's host is refused before anything resolves it. */
+function refusedHost(url: URL, allowPrivateNetwork: boolean): boolean {
+  if (allowPrivateNetwork) return false;
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  return isIP(host) ? privateAddress(host) : localName(host);
 }
 
 function refuse(): never {
@@ -36,21 +41,17 @@ function refuse(): never {
 }
 
 /** For each endpoint the SDK is about to use, and the authorization URL before a person opens it. */
-export function checkDestination(allowed: HostPolicy) {
+export function checkDestination(allowPrivateNetwork: boolean) {
   return (url: URL, _purpose: NetworkPurpose, _operation: Operation): void => {
-    if (url.protocol !== "https:" || url.username || url.password) refuse();
-    const host = url.hostname.replace(/^\[|\]$/g, "");
-    if (isIP(host) && privateAddress(host) && !allowed(url.hostname)) refuse();
+    if (url.protocol !== "https:" || url.username || url.password || refusedHost(url, allowPrivateNetwork)) refuse();
   };
 }
 
-export function policyFetch(allowed: HostPolicy): PolicyFetch {
+export function policyFetch(allowPrivateNetwork: boolean): PolicyFetch {
   return async (url, init, { operation }) => {
     const target = new URL(url);
-    if (target.protocol !== "https:" || target.username || target.password) refuse();
-    const exempt = allowed(target.hostname);
-    const literal = target.hostname.replace(/^\[|\]$/g, "");
-    if (isIP(literal) && privateAddress(literal) && !exempt) refuse();
+    if (target.protocol !== "https:" || target.username || target.password || refusedHost(target, allowPrivateNetwork)) refuse();
+    const exempt = allowPrivateNetwork;
     const signal = init.signal ? AbortSignal.any([init.signal, operation.signal]) : operation.signal;
     // Request normalizes the body and its content type.
     const prepared = new Request(url, { method: init.method ?? "GET", headers: init.headers, body: init.body ?? null });

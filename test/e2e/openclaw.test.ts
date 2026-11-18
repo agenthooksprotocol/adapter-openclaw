@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
+import { AuthServer, makeTls } from "./oauth-server.ts";
 
 const REPO = resolve(import.meta.dir, "../..");
 const root = realpathSync(mkdtempSync(join(tmpdir(), "ahp-openclaw-e2e-")));
@@ -28,7 +29,7 @@ beforeAll(async () => {
 
 type Event = Record<string, any> & { type: string };
 type Request = { model: string; tools?: { function?: { name?: string } }[]; messages: { role: string; content: unknown; tool_calls?: unknown[] }[] };
-type Options = { toolSearch?: boolean; grants?: Record<string, boolean>; backends?: (recorder: Record<string, unknown>) => Record<string, unknown>[]; events?: { intercept: string[]; observe: string[] } };
+type Options = { env?: Record<string, string>; pluginConfig?: Record<string, unknown>; toolSearch?: boolean; grants?: Record<string, boolean>; backends?: (recorder: Record<string, unknown>) => Record<string, unknown>[]; events?: { intercept: string[]; observe: string[] } };
 
 const body = (text: string) => ({ kind: "text", mediaType: "text/plain", selection: "body", text });
 const inject = (event: Event, text: string) => ({ type: "inject", target: "context", operation: "append", deliverAt: "now", value: [{ id: `i-${event.id}`, role: "user", parts: [{ id: `i-${event.id}#0`, ...body(text) }] }] });
@@ -145,6 +146,7 @@ class World {
       OPENCLAW_NO_RESPAWN: "1",
       AHP_HOOKS_FILE: join(this.dir, "hooks.json"),
       ...(process.env.AHP_DEBUG ? { AHP_DEBUG: "1" } : {}),
+      ...this.options.env,
     };
   }
 
@@ -181,6 +183,7 @@ class World {
     }
     const config = JSON.parse(readFileSync(join(this.home, "openclaw.json"), "utf8"));
     if (this.options.grants) config.plugins.entries[PLUGIN] = { ...config.plugins.entries[PLUGIN], hooks: this.options.grants };
+    if (this.options.pluginConfig) config.plugins.entries[PLUGIN] = { ...config.plugins.entries[PLUGIN], config: this.options.pluginConfig };
     config.plugins.load = { paths: [join(import.meta.dir, "channel-plugin")] };
     config.plugins.entries.recch = { enabled: true };
     config.channels = { recch: { enabled: true } };
@@ -888,4 +891,108 @@ describe.each(VERSIONS)("OpenClaw $name, set up differently", ({ dir }) => {
       await world.stop();
     }
   }, 300000);
+});
+
+// Sign-in: a backend that wants OAuth, a fake authorization server, and the Gateway's
+// own callback route. The person's browser is a fetch that follows the redirect.
+describe.each(VERSIONS)("OpenClaw $name: OAuth sign-in", ({ dir }) => {
+  let world: World;
+  let oauth: AuthServer;
+  const ID = "org.example.secured";
+  beforeAll(async () => {
+    const tlsDir = mkdtempSync(join(root, "tls-"));
+    const tls = makeTls(tlsDir);
+    oauth = new AuthServer(tls);
+    world = new World(dir, {
+      env: { NODE_EXTRA_CA_CERTS: tls.ca },
+      backends: (recorder) => [recorder, {
+        id: ID,
+        transport: { type: "http", url: oauth.resource },
+        // The same settings every harness's adapter reads from a shared hooks.json.
+        oauth: { issuer: oauth.origin, registration: true, allowPrivateNetwork: true },
+        subscriptions: [
+          { mode: "intercept", events: ["turn.start"], timeoutMs: 30000, failurePolicy: "fail-open", content: { default: "body" } },
+          { mode: "observe", events: ["turn.end"], content: { default: "body" } },
+        ],
+      }],
+    });
+    await world.start();
+  }, 300000);
+  afterAll(async () => {
+    await world.stop();
+    oauth.stop();
+  });
+
+  const hints = () => [...world.log().matchAll(new RegExp(`sign in to ${ID.replaceAll(".", "\\.")}: (\\S+)`, "g"))].map((match) => match[1]!);
+
+  test("a backend that wants a sign-in is hinted at the next turn, with one link until it is used", async () => {
+    const key = world.sessionKey();
+    expect((await world.say(key, "hello")).reply).toBe("final answer");
+    // Delivered anonymously, refused, and the turn went on: the backend is fail-open.
+    expect(oauth.unauthorized).toBeGreaterThan(0);
+    expect(oauth.deliveries).toHaveLength(0);
+    await world.say(key, "again");
+    await world.until(() => hints().length > 0, "the sign-in hint in the Gateway log");
+    const [link] = hints();
+    expect(link!.startsWith(`${oauth.origin}/authorize?`)).toBe(true);
+    // The client was registered dynamically, for the Gateway's callback.
+    const [client] = [...oauth.clients.values()];
+    expect(client!.redirectUris).toEqual([`http://127.0.0.1:${world.port}/ahp/oauth/callback`]);
+    await world.say(key, "and again");
+    await Bun.sleep(1000);
+    expect(new Set(hints())).toEqual(new Set([link!]));
+    const status = await world.cli(["ahp", "status"]);
+    expect(status.stdout).toContain(`${ID}: needs-login: ${link}`);
+    expect(status.stdout).toContain("org.example.recorder: no OAuth");
+    // Never in what the model reads.
+    expect(world.requests.some((request) => JSON.stringify(request).includes("/authorize"))).toBe(false);
+  }, 180000);
+
+  test("openclaw ahp login reuses the link, the Gateway's callback completes it, and deliveries carry the token", async () => {
+    const [hinted] = hints();
+    const child = Bun.spawn(["node", join(world.openclaw, "openclaw.mjs"), "ahp", "login", ID], { cwd: world.project, env: world.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+    let printed = "";
+    while (!/Sign in to \S+: (\S+)/.test(printed)) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`login exited: ${printed} ${await new Response(child.stderr).text()}`);
+      printed += new TextDecoder().decode(value);
+    }
+    const url = /Sign in to \S+: (\S+)/.exec(printed)![1]!;
+    expect(url).toBe(hinted!);
+    // The browser: the authorization server sends it back to the Gateway.
+    const authorized = await fetch(url, { redirect: "manual", tls: { rejectUnauthorized: false } } as RequestInit);
+    expect(authorized.status).toBe(302);
+    const callback = authorized.headers.get("location")!;
+    expect(callback.startsWith(`http://127.0.0.1:${world.port}/ahp/oauth/callback?`)).toBe(true);
+    const landed = await fetch(callback);
+    expect(landed.status).toBe(200);
+    expect(await landed.text()).toContain("You can close this tab");
+    // The same link again is spent.
+    expect((await fetch(callback)).status).toBe(400);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      printed += new TextDecoder().decode(value);
+    }
+    expect(await child.exited).toBe(0);
+    expect(printed).toContain(`${ID}: signed in`);
+
+    const key = world.sessionKey();
+    expect((await world.say(key, "signed in now")).reply).toBe("final answer");
+    await world.until(() => oauth.deliveries.some((delivery) => delivery.type === "turn.end"), "an authenticated turn.end");
+    const tokens = new Set(oauth.deliveries.map((delivery) => delivery.authorization));
+    expect(tokens.size).toBe(1);
+    expect(oauth.tokens.has([...tokens][0]!.replace("Bearer ", ""))).toBe(true);
+    expect((await world.cli(["ahp", "status"])).stdout).toContain(`${ID}: authorized`);
+    // Signed in: nothing more to do, and no new consent.
+    const again = await world.cli(["ahp", "login"]);
+    expect(again.stdout).toContain("No backend needs a sign-in.");
+  }, 180000);
+
+  test("openclaw ahp logout deletes only that backend's grant", async () => {
+    const out = await world.cli(["ahp", "logout", ID]);
+    expect(out.stdout).toContain(`${ID}: signed out`);
+    expect((await world.cli(["ahp", "status"])).stdout).toContain(`${ID}: needs-login`);
+  }, 120000);
 });
