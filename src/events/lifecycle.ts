@@ -37,7 +37,11 @@ export function lifecycle(adapter: Adapter): void {
   api.on("gateway_start", (event) => {
     adapter.gateway = true;
     // The sign-in redirect comes back to this port.
-    if (event?.port) adapter.port = event.port;
+    if (event?.port) {
+      adapter.port = event.port;
+      // `openclaw ahp` reuses it, whatever `--port` the Gateway was started with.
+      void adapter.logins()?.recordRedirect().catch(() => {});
+    }
     void adapter.hooks();
   });
 

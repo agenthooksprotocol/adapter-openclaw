@@ -4,7 +4,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthError } from "agenthooksprotocol/client";
-import type { StoredRecord } from "agenthooksprotocol/oauth";
+import { bindingKey, frame, type StoredRecord } from "agenthooksprotocol/oauth";
 import { Logins, type LoginHost } from "../../src/oauth/logins";
 import { privateAddress } from "../../src/oauth/network";
 import { fileSecretStore, resolveSecret } from "../../src/oauth/secrets";
@@ -44,10 +44,10 @@ class Table<T> implements KeyedStore<T> {
     const row = this.#live(key);
     return { value: row?.value, comparison: String(row?.version ?? "absent") };
   }
-  async compareAndApply(key: string, comparison: string, intent: { action: string; value?: T }) {
+  async compareAndApply(key: string, comparison: string, intent: { action: string; value?: T; ttlMs?: number }) {
     const current = await this.observe(key);
     if (current.comparison !== comparison) return { status: "conflict" as const, current };
-    if (intent.action === "set") this.#set(key, intent.value as T);
+    if (intent.action === "set") this.#set(key, intent.value as T, intent.ttlMs);
     else if (intent.action === "delete") this.rows.delete(key);
     return { status: intent.action === "keep" ? "unchanged" as const : "applied" as const };
   }
@@ -115,6 +115,38 @@ describe("the token store", () => {
   });
 });
 
+describe("lease loss", () => {
+  test("a holder whose lease was taken commits nothing, and says so", async () => {
+    const records = new Table<StoredRecord>(), leases = new Table<string>();
+    const warnings: string[] = [];
+    const store = keyedTokenStore(records, leases, { leaseMs: 90, warn: (text) => warnings.push(text) });
+    const key = "ahp.oauth.grant:k";
+    const result = await store.coordinate(key, signal(), async () => {
+      // Another process takes the lease, as after a stall past its expiry.
+      const lease = [...leases.rows.keys()][0]!;
+      leases.rows.set(lease, { value: "someone else", version: 999 });
+      await Bun.sleep(80);
+      return store.compareAndSet(key, undefined, grant("late"), signal());
+    });
+    expect(result).toBe(false);
+    expect(await store.load(key, signal())).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    // The other holder's lease is not released by the one that lost it.
+    expect([...leases.rows.values()][0]?.value).toBe("someone else");
+  });
+
+  test("renewal keeps a long holder's lease, atomically", async () => {
+    const records = new Table<StoredRecord>(), leases = new Table<string>();
+    const store = keyedTokenStore(records, leases, { leaseMs: 60 });
+    const key = "ahp.oauth.grant:long";
+    const written = await store.coordinate(key, signal(), async () => {
+      await Bun.sleep(200);
+      return store.compareAndSet(key, undefined, grant("1"), signal());
+    });
+    expect(written).toBe(true);
+  });
+});
+
 describe("secrets", () => {
   test("issued secrets are 0600 files in a 0700 directory, apart from tokens", async () => {
     const directory = join(dir, "secrets");
@@ -139,8 +171,16 @@ describe("secrets", () => {
 
 describe("network policy", () => {
   test("private, loopback and link-local addresses are refused by default", () => {
-    for (const address of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "::1", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "0.0.0.0"]) expect(privateAddress(address)).toBe(true);
-    for (const address of ["8.8.8.8", "1.1.1.1", "2606:4700::1111"]) expect(privateAddress(address)).toBe(false);
+    for (const address of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "192.0.2.1", "198.18.0.1", "255.255.255.255", "::1", "::", "fd00::1", "fe80::1", "ff02::1", "2001:db8::1", "2001::1", "0.0.0.0"]) expect(privateAddress(address)).toBe(true);
+    for (const address of ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "2a00:1450::1"]) expect(privateAddress(address)).toBe(false);
+  });
+
+  test("an IPv4 address inside IPv6 is checked as IPv4, and 6to4 is refused", () => {
+    // The URL parser rewrites a mapped literal to hex groups: that form is checked too.
+    expect(new URL("https://[::ffff:127.0.0.1]/").hostname).toBe("[::ffff:7f00:1]");
+    for (const address of ["::ffff:127.0.0.1", "::ffff:7f00:1", "[::ffff:7f00:1]", "::ffff:a00:1", "::127.0.0.1", "::7f00:1", "64:ff9b::7f00:1", "64:ff9b::a00:1", "64:ff9b::192.168.0.1", "64:ff9b:1::1", "2002:7f00:1::1", "2002:808:808::1"]) expect(privateAddress(address)).toBe(true);
+    for (const address of ["::ffff:8.8.8.8", "::ffff:808:808", "64:ff9b::808:808"]) expect(privateAddress(address)).toBe(false);
+    expect(privateAddress("not an address")).toBe(true);
   });
 });
 
@@ -170,16 +210,18 @@ describe("settings", () => {
   });
 });
 
-function logins(backends: Record<string, unknown>[], settings = {}): Logins {
+function logins(backends: Record<string, unknown>[], settings = {}, extra: Partial<LoginHost> = {}): Logins {
   const host: LoginHost = {
     store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()),
     secrets: fileSecretStore(join(dir, "s")),
     settings: { secrets: { "the-secret": "shh" }, ...settings },
     environment: {},
-    port: () => 18789,
+    livePort: () => undefined,
+    configuredPort: () => 18789,
     backends: () => backends as never,
     log: () => {},
     warn: () => {},
+    ...extra,
   };
   return new Logins(host);
 }
@@ -264,5 +306,94 @@ describe("the callback receiver", () => {
     const post = response();
     await receiver(async () => "x")({ method: "POST", url: "/ahp/oauth/callback" } as never, post as never);
     expect(post.sent.status).toBe(405);
+  });
+});
+
+describe("redirect", () => {
+  const http = { id: "a", transport: { type: "http", url: "https://hooks.example/ahp" }, oauth: { issuer: "https://as.example" } };
+
+  test("publicUrl must be https, or http on loopback, and keeps a path prefix", () => {
+    const warnings: string[] = [];
+    const at = (publicUrl: string) => logins([http], { publicUrl }, { warn: (text) => warnings.push(text) }).redirectUri;
+    expect(at("https://gw.example/openclaw/")).toBe("https://gw.example/openclaw/ahp/oauth/callback");
+    expect(at("http://127.0.0.1:9000")).toBe("http://127.0.0.1:9000/ahp/oauth/callback");
+    expect(at("http://gw.example")).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
+    expect(at("https://user:pw@gw.example")).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
+    expect(at("https://gw.example/?x=1")).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
+    expect(warnings).toHaveLength(3);
+  });
+
+  test("openclaw ahp uses the redirect the running Gateway recorded, whatever its --port", async () => {
+    const saved = new Map<string, string>();
+    const redirects = { lookup: async (key: string) => saved.get(key), register: async (key: string, value: string) => { saved.set(key, value); } };
+    const gateway = logins([http], {}, { livePort: () => 4242, redirects });
+    await gateway.recordRedirect();
+    const cli = logins([http], {}, { redirects });
+    expect(cli.redirectUri).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
+    await cli.loadRedirect();
+    expect(cli.redirectUri).toBe("http://127.0.0.1:4242/ahp/oauth/callback");
+    expect(cli.selectClient(["https://as.example"], "r", { backendId: "a", purpose: "event", url: "https://hooks.example/ahp" }).redirectUri).toBe(gateway.redirectUri);
+  });
+});
+
+describe("logins", () => {
+  const backend = (id: string) => ({ id, transport: { type: "http", url: `https://hooks.example/${id}` }, oauth: { issuer: "https://as.example" } });
+
+  test("a callback completes the backend whose pending login it answers, of two", async () => {
+    const store = keyedTokenStore(new Table<StoredRecord>(), new Table<string>());
+    const finished: string[] = [];
+    class Recording extends Logins {
+      protected override async finish(backendId: string) { finished.push(backendId); }
+    }
+    const instance = new Recording({ store, secrets: fileSecretStore(join(dir, "s2")), settings: {}, environment: {}, livePort: () => undefined, configuredPort: () => 18789, backends: () => [backend("a"), backend("b")] as never, log: () => {}, warn: () => {} });
+    for (const id of ["a", "b"]) {
+      const context = instance.context(backend(id) as never)!;
+      const key = frame("ahp.oauth.pending:", [bindingKey("openclaw", context)]);
+      await store.compareAndSet(key, undefined, { kind: "pending_login", generation: "g", id: `login-${id}`, grantKey: `grant-${id}`, expiresAt: Date.now() + 60_000, authorizationUrl: `https://as.example/authorize?state=state-${id}`, state: `state-${id}`, verifier: "v", client: {} as never, metadata: {} as never, context: { backendId: id, purpose: "event", url: context.url } }, signal());
+    }
+    expect(await instance.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=state-b")).toBe("b");
+    expect(finished).toEqual(["b"]);
+    await expect(instance.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=state-z")).rejects.toThrow(AuthError);
+    expect(finished).toEqual(["b"]);
+  });
+
+  test("a backend skipped at initialization gets its client back once signed in elsewhere; one that is signed in is not prepared", async () => {
+    const prepared: string[] = [];
+    const logged: string[] = [];
+    class Signed extends Logins {
+      override async status() { return { state: "authorized" as const }; }
+      override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
+    }
+    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, livePort: () => undefined, configuredPort: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
+    const restarted: string[] = [];
+    instance.onLogin = (id) => { restarted.push(id); instance.initializationFailed.delete(id); };
+    instance.initializationFailed.add("a");
+    await instance.hint();
+    expect(restarted).toEqual(["a"]);
+    await instance.hint();
+    expect(restarted).toEqual(["a"]);
+    expect(prepared).toEqual([]);
+    expect(logged).toEqual([]);
+  });
+
+  test("a sign-in that cannot be prepared is warned of once per backend and reason, without its link", async () => {
+    const warnings: string[] = [];
+    class Failing extends Logins {
+      override async status() { return { state: "needs-login" as const }; }
+      override async login(): Promise<never> { throw new AuthError("discovery_failed"); }
+    }
+    const instance = new Failing({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, livePort: () => undefined, configuredPort: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
+    await instance.hint();
+    await instance.hint();
+    expect(warnings).toEqual(["Agent Hooks Protocol: a: a sign-in could not be prepared (discovery_failed)"]);
+  });
+
+  test("the Gateway log says a sign-in is needed, once per link, and never shows the link", () => {
+    const warnings: string[] = [];
+    const instance = logins([backend("a")], {}, { warn: (text) => warnings.push(text) });
+    instance.show("a", "https://as.example/authorize?state=secret");
+    instance.show("a", "https://as.example/authorize?state=secret");
+    instance.show("a", "https://as.example/authorize?state=next");
+    expect(warnings).toEqual(Array(2).fill("Agent Hooks Protocol: sign-in needed for a: run `openclaw ahp login a` on the Gateway's host"));
   });
 });

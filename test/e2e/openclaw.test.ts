@@ -928,7 +928,10 @@ describe.each(VERSIONS)("OpenClaw $name: OAuth sign-in", ({ name, dir }) => {
   });
 
   const lines = (pattern: RegExp) => world.log().split("\n").filter((line) => pattern.test(line));
-  const hints = (id: string) => lines(new RegExp(`sign in to ${id.replaceAll(".", "\\.")}: `)).map((line) => /: (https:\S+)/.exec(line)![1]!);
+  /** The Gateway log's "sign-in needed" lines for a backend. */
+  const hints = (id: string) => lines(new RegExp(`sign-in needed for ${id.replaceAll(".", "\\.")}: `));
+  /** The link `openclaw ahp status` shows on the Gateway's host. */
+  const link = async (id: string) => new RegExp(`${id.replaceAll(".", "\\.")}: needs-login: (\\S+)`).exec((await world.cli(["ahp", "status"])).stdout)?.[1];
   /** `openclaw ahp login`, until it prints a link. */
   async function startLogin(args: string[]) {
     const child = Bun.spawn(["node", join(world.openclaw, "openclaw.mjs"), "ahp", "login", ...args], { cwd: world.project, env: world.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -957,25 +960,28 @@ describe.each(VERSIONS)("OpenClaw $name: OAuth sign-in", ({ name, dir }) => {
     expect(oauth.deliveries).toHaveLength(0);
     await world.say(key, "again");
     await world.until(() => hints(ID).length > 0 && hints(OTHER).length > 0, "the sign-in hints in the Gateway log");
-    const [link] = hints(ID);
-    expect(link!.startsWith(`${oauth.origin}/authorize?`)).toBe(true);
+    expect(hints(ID)[0]).toContain(`run \`openclaw ahp login ${ID}\``);
+    // The link is not in the Gateway log, which any operator with read access can tail.
+    expect(world.log()).not.toContain("/authorize?");
+    const first = await link(ID);
+    expect(first!.startsWith(`${oauth.origin}/authorize?`)).toBe(true);
     // Each backend has its own login.
-    expect(hints(OTHER)[0]).not.toBe(link);
+    expect(await link(OTHER)).not.toBe(first);
     // Clients were registered dynamically, for the Gateway's callback.
     for (const client of oauth.clients.values()) expect(client.redirectUris).toEqual([`http://127.0.0.1:${world.port}/ahp/oauth/callback`]);
     await world.say(key, "and again");
     await Bun.sleep(1000);
-    expect(new Set(hints(ID))).toEqual(new Set([link!]));
+    // The same link, said once, until it is used.
     expect(hints(ID)).toHaveLength(1);
+    expect(await link(ID)).toBe(first!);
     const status = await world.cli(["ahp", "status"]);
-    expect(status.stdout).toContain(`${ID}: needs-login: ${link}`);
     expect(status.stdout).toContain("org.example.recorder: no OAuth");
     // Never in what the model reads.
     expect(world.requests.some((request) => JSON.stringify(request).includes("/authorize"))).toBe(false);
   }, 180000);
 
   test.if(supported)("openclaw ahp login reuses the link, the Gateway's callback completes it, and deliveries carry the token", async () => {
-    const [hinted] = hints(ID);
+    const hinted = await link(ID);
     const login = await startLogin([ID]);
     const { child, reader } = login;
     let { printed } = login;

@@ -165,15 +165,18 @@ export class Adapter {
       const settings = (this.api.pluginConfig ?? {}) as PluginSettings;
       const environment = process.env;
       const { state } = this.api.runtime;
+      const redirects = state.openKeyedStore<string>({ namespace: "ahp-oauth-gateway", retention: "retained" }) as unknown as KeyedStore<string>;
       const records = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth", retention: "retained" }) as unknown as KeyedStore<StoredRecord>;
       const leases = state.openKeyedStore<string>({ namespace: "ahp-oauth-leases", maxEntries: 10_000 }) as unknown as KeyedStore<string>;
       const directory = join(stateDir(environment) ?? state.resolveStateDir(), "plugins", PLUGIN_ID, "oauth-secrets");
       const logins = new Logins({
-        store: keyedTokenStore(records, leases),
+        store: keyedTokenStore(records, leases, { warn: (text) => this.warn(text) }),
         secrets: Logins.secrets(fileSecretStore(directory), settings, environment),
         settings,
         environment,
-        port: () => this.port ?? configuredPort(this.api.config as never, environment),
+        livePort: () => this.port,
+        configuredPort: () => configuredPort(this.api.config as never, environment),
+        redirects,
         backends: () => (this.registration().registration?.hooks ?? []) as never,
         log: (text) => this.log(text),
         warn: (text) => this.warn(text),
@@ -193,7 +196,7 @@ export class Adapter {
   /** At the start of a turn: links for backends that need a sign-in, in the background. */
   hintLogins(): void {
     if (!this.registration().registration) return;
-    this.logins()?.hint();
+    void this.logins()?.hint();
   }
 
   /** A new client, for a registration that can now initialize in full. */

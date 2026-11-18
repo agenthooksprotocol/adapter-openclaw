@@ -48,7 +48,7 @@ export function describeStatus(status: Status, withLink: boolean): string {
     case "failing": return `failing: ${status.reason}`;
     case "needs-login":
       if (!status.url) return "needs-login";
-      return withLink ? `needs-login: ${status.url} (valid until ${new Date(status.expiresAt!).toISOString()})` : "needs-login (link in the Gateway log)";
+      return withLink ? `needs-login: ${status.url} (valid until ${new Date(status.expiresAt!).toISOString()})` : "needs-login (run `openclaw ahp login` on the Gateway's host)";
   }
 }
 
@@ -78,8 +78,8 @@ export function chatCommand(logins: () => Logins, backends: () => { id: string }
           const result = await current.login(target.id);
           if (result.type === "ready") lines.push(`${target.id}: already signed in`);
           else {
-            current.show(target.id, result.url, result.expiresAt);
-            lines.push(`${target.id}: the sign-in link is in the Gateway log, or run \`openclaw ahp login ${target.id}\` on the Gateway's host`);
+            current.show(target.id, result.url);
+            lines.push(`${target.id}: run \`openclaw ahp login ${target.id}\` on the Gateway's host for the sign-in link`);
           }
         }
         return { text: lines.join("\n") };
@@ -100,14 +100,17 @@ interface Command {
 }
 
 /** `openclaw ahp`: a terminal on the Gateway's host is the operator's own, so links show. */
-export function cliCommands(program: Command, logins: () => Logins, backends: () => { id: string }[]): void {
+export function cliCommands(program: Command, gateway: () => Logins, backends: () => { id: string }[]): void {
+  let loaded: Promise<Logins> | undefined;
+  // Logins prepared here use the redirect the running Gateway recorded.
+  const logins = () => (loaded ??= (async () => { const current = gateway(); await current.loadRedirect().catch(() => {}); return current; })());
   const ahp = program.command("ahp").description("Agent Hooks Protocol: backend sign-in");
   ahp.command("status").description("How each backend in hooks.json authenticates").action(async () => {
-    console.log(await statusLines(logins(), backends(), true));
+    console.log(await statusLines(await logins(), backends(), true));
   });
   ahp.command("login").argument("[backend]", "a backend id; without one, every backend that needs it")
     .description("Sign in to a backend, in a browser").action(async (id?: string) => {
-      const current = logins();
+      const current = await logins();
       const targets = id ? [{ id }] : await current.waiting();
       if (!targets.length) return console.log("No backend needs a sign-in.");
       let failed = false;
@@ -127,10 +130,10 @@ export function cliCommands(program: Command, logins: () => Logins, backends: ()
     });
   ahp.command("complete").argument("<url>", "the address the browser ended on")
     .description("Finish a sign-in when the browser could not reach the Gateway").action(async (url: string) => {
-      console.log(`${await logins().complete(url)}: signed in`);
+      console.log(`${await (await logins()).complete(url)}: signed in`);
     });
   ahp.command("logout").argument("<backend>").description("Cancel a backend's sign-in and delete its tokens").action(async (id: string) => {
-    console.log((await logins().logout(id)) ? `${id}: signed out` : `${id}: was not signed in`);
+    console.log((await (await logins()).logout(id)) ? `${id}: signed out` : `${id}: was not signed in`);
   });
 }
 

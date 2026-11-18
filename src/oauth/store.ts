@@ -13,7 +13,7 @@ export interface KeyedStore<T> {
   deleteIfEqual?: (key: string, expected: string | number | boolean | null) => Promise<boolean>;
   observe?: (key: string) => Promise<{ value: T | undefined; comparison: string }>;
   compareAndApply?: (key: string, comparison: string, intent:
-    | { operation: "update"; action: "set"; value: T }
+    | { operation: "update"; action: "set"; value: T; ttlMs?: number }
     | { operation: "update" | "delete"; action: "keep" }
     | { operation: "delete"; action: "delete" }) => Promise<{ status: "applied" | "unchanged" } | { status: "conflict"; current: { value: T | undefined; comparison: string } }>;
 }
@@ -50,11 +50,35 @@ function waitFor(previous: Promise<unknown>, signal: AbortSignal): Promise<void>
  * promise chain, and across processes with a lease row taken by registerIfAbsent,
  * renewed while the work runs and released when it settles.
  */
-export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: KeyedStore<string>, options: { leaseMs?: number } = {}): TokenStore {
+export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: KeyedStore<string>, options: { leaseMs?: number; warn?: (text: string) => void } = {}): TokenStore {
   const leaseMs = options.leaseMs ?? LEASE_MS;
   const chains = new Map<string, Promise<unknown>>();
-  if (!records.observe || !records.compareAndApply) throw new Error("this OpenClaw has no compare-and-apply plugin state");
+  if (!records.observe || !records.compareAndApply || !leases.observe || !leases.compareAndApply) throw new Error("this OpenClaw has no compare-and-apply plugin state");
   const observe = records.observe.bind(records), apply = records.compareAndApply.bind(records);
+  const observeLease = leases.observe.bind(leases), applyLease = leases.compareAndApply.bind(leases);
+  /** Leases this process holds, by stored key. A lost one commits nothing more. */
+  const held = new Map<string, { token: string; lost: boolean }>();
+
+  /** Extend the lease only while it is still this holder's, in one compare-and-apply. */
+  async function renew(key: string, lease: { token: string; lost: boolean }): Promise<void> {
+    try {
+      const seen = await observeLease(key);
+      if (seen.value !== lease.token) throw new Error("taken");
+      const result = await applyLease(key, seen.comparison, { operation: "update", action: "set", value: lease.token, ttlMs: leaseMs });
+      if (result.status === "conflict") throw new Error("taken");
+    } catch {
+      if (!lease.lost) options.warn?.("Agent Hooks Protocol: an OAuth lock was lost while held; its work commits nothing more");
+      lease.lost = true;
+    }
+  }
+
+  /** Before a write under a lease: is it still this holder's? */
+  async function stillHeld(key: string): Promise<boolean> {
+    const lease = held.get(key);
+    if (!lease) return true;
+    if (!lease.lost && (await leases.lookup(key)) !== lease.token) lease.lost = true;
+    return !lease.lost;
+  }
 
   async function acquire(key: string, token: string, signal: AbortSignal): Promise<void> {
     for (let wait = 20; ; wait = Math.min(wait * 2, 250)) {
@@ -82,6 +106,8 @@ export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: Keyed
         const seen = await observe(stored);
         if (seen.value?.generation !== expected) return false;
         signal.throwIfAborted();
+        // A holder whose lease expired or was taken must not overwrite the new holder's work.
+        if (!(await stillHeld(stored))) return false;
         const result = await apply(stored, seen.comparison, value !== undefined
           ? { operation: "update", action: "set", value }
           : seen.value === undefined ? { operation: "delete", action: "keep" } : { operation: "delete", action: "delete" });
@@ -99,14 +125,15 @@ export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: Keyed
         signal.throwIfAborted();
         const token = crypto.randomUUID();
         await acquire(stored, token, signal);
-        const renew = setInterval(() => {
-          void leases.lookup(stored).then((holder) => holder === token ? leases.register(stored, token, { ttlMs: leaseMs }) : undefined).catch(() => {});
-        }, Math.max(1, Math.floor(leaseMs / 3)));
+        const lease = { token, lost: false };
+        held.set(stored, lease);
+        const timer = setInterval(() => void renew(stored, lease), Math.max(1, Math.floor(leaseMs / 3)));
         try {
           signal.throwIfAborted();
           return await work();
         } finally {
-          clearInterval(renew);
+          clearInterval(timer);
+          if (held.get(stored) === lease) held.delete(stored);
           await release(stored, token).catch(() => {});
         }
       })();

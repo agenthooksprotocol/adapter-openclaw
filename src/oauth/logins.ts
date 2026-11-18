@@ -44,8 +44,12 @@ export interface LoginHost {
   secrets: SecretStore;
   settings: PluginSettings;
   environment: Record<string, string | undefined>;
-  /** Where the Gateway listens: known exactly inside it, from config outside. */
-  port: () => number;
+  /** The port the Gateway listens on: known inside it once it has started. */
+  livePort: () => number | undefined;
+  /** The port config names, for a process that is not the Gateway. */
+  configuredPort: () => number;
+  /** Where the Gateway records its live redirect, for `openclaw ahp` to use the same. */
+  redirects?: { lookup(key: string): Promise<string | undefined>; register(key: string, value: string): Promise<void> };
   backends: () => Backend[];
   log: (text: string) => void;
   warn: (text: string) => void;
@@ -58,6 +62,21 @@ export function configuredPort(config: { gateway?: { port?: unknown } } | undefi
   const port = config?.gateway?.port;
   return typeof port === "number" && port > 0 ? port : DEFAULT_PORT;
 }
+
+/** `publicUrl`: HTTPS, or HTTP on a loopback literal; no credentials, query or
+ * fragment. A path prefix is kept: `https://host/gw` redirects to
+ * `https://host/gw/ahp/oauth/callback`, for a proxy that strips it. */
+export function publicBase(value: unknown): { base?: string; problem?: string } {
+  if (value === undefined) return {};
+  let url: URL;
+  try { url = new URL(String(value)); } catch { return { problem: "publicUrl is not a URL; ignored" }; }
+  const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return { problem: "publicUrl is not https (or http on a loopback address); ignored" };
+  if (url.username || url.password || url.search || url.hash) return { problem: "publicUrl has credentials, a query or a fragment; ignored" };
+  return { base: `${url.origin}${url.pathname.replace(/\/+$/, "")}` };
+}
+
+const REDIRECT_KEY = "gateway-redirect";
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -80,12 +99,20 @@ export class Logins {
   /** The last link logged for a backend: repeated turns show the same one once. */
   readonly #shown = new Map<string, string>();
   readonly #checking = new Set<string>();
+  /** Failures to prepare a sign-in already warned of, by backend and code. */
+  readonly #warned = new Set<string>();
+  readonly #publicBase: string | undefined;
+  /** The Gateway's recorded redirect, read by a process that is not the Gateway. */
+  #savedRedirect: string | undefined;
   /** Backends initialization skipped for authentication: their client starts again after a login. */
   readonly initializationFailed = new Set<string>();
   onLogin?: (backendId: string) => void;
 
   constructor(host: LoginHost) {
     this.#host = host;
+    const { base, problem } = publicBase(host.settings.publicUrl);
+    if (problem) host.warn(`Agent Hooks Protocol: ${problem}`);
+    this.#publicBase = base;
   }
 
   /** A backend's settings and managed OAuth; problems with its `oauth` are warned once. */
@@ -118,9 +145,24 @@ export class Logins {
     challenge: (context) => this.#for(context.backendId).route.challenge(context),
   };
 
+  /** Stable per grant: a pending login is reused only for the same redirect. The
+   * Gateway's live port wins; `openclaw ahp` uses what the Gateway recorded, then config. */
   get redirectUri(): string {
-    const base = this.#host.settings.publicUrl;
-    return base ? new URL(CALLBACK_PATH, base).href : `http://127.0.0.1:${this.#host.port()}${CALLBACK_PATH}`;
+    if (this.#publicBase) return `${this.#publicBase}${CALLBACK_PATH}`;
+    const live = this.#host.livePort();
+    if (live) return `http://127.0.0.1:${live}${CALLBACK_PATH}`;
+    return this.#savedRedirect ?? `http://127.0.0.1:${this.#host.configuredPort()}${CALLBACK_PATH}`;
+  }
+
+  /** In the Gateway, once it listens: record the redirect it answers. */
+  async recordRedirect(): Promise<void> {
+    if (this.#host.livePort()) await this.#host.redirects?.register(REDIRECT_KEY, this.redirectUri);
+  }
+
+  /** Outside the Gateway: use the redirect it recorded. */
+  async loadRedirect(): Promise<void> {
+    const saved = await this.#host.redirects?.lookup(REDIRECT_KEY);
+    if (typeof saved === "string" && saved.endsWith(CALLBACK_PATH)) this.#savedRedirect = saved;
   }
 
   resolveReference(reference: string): string | undefined {
@@ -277,26 +319,41 @@ export class Logins {
 
   /** At the start of a turn: prepare, in the background, the logins backends need, and
    * log each link once. Never awaited by the turn. */
-  hint(): void {
+  hint(): Promise<void> {
+    const work: Promise<void>[] = [];
     for (const backend of this.#host.backends()) {
       const kind = this.kind(backend);
       if (kind !== "login" && !(kind === "none" && this.#needed.has(backend.id))) continue;
       if (this.#checking.has(backend.id)) continue;
       this.#checking.add(backend.id);
-      void (async () => {
-        if ((await this.status(backend)).state !== "needs-login") return this.#ready(backend.id);
+      work.push((async () => {
+        const status = await this.status(backend);
+        if (status.state !== "needs-login") {
+          // Signed in elsewhere (`openclaw ahp complete`, a paste): a backend skipped at
+          // initialization gets its client back here too.
+          if (status.state === "authorized" && this.initializationFailed.has(backend.id)) this.onLogin?.(backend.id);
+          return this.#ready(backend.id);
+        }
         this.#host.log(`${backend.id}: preparing a sign-in`);
         const result = await this.login(backend.id);
-        if (result.type === "pending") this.show(backend.id, result.url, result.expiresAt);
-      })().catch((error) => this.#host.log(`${backend.id}: sign-in not prepared (${describe(error)})`)).finally(() => this.#checking.delete(backend.id));
+        if (result.type === "pending") this.show(backend.id, result.url);
+      })().catch((error) => {
+        const key = `${backend.id}\0${describe(error)}`;
+        if (this.#warned.has(key)) return;
+        this.#warned.add(key);
+        this.#host.warn(`Agent Hooks Protocol: ${backend.id}: a sign-in could not be prepared (${describe(error)})`);
+      }).finally(() => this.#checking.delete(backend.id)));
     }
+    return Promise.all(work).then(() => {});
   }
 
-  /** The operator's private surface inside the Gateway: its log. */
-  show(backendId: string, url: string, expiresAt: number): void {
+  /** Inside the Gateway: that a sign-in is needed, once per link. The link itself is
+   * shown only on the Gateway host's terminal, by `openclaw ahp`: the Gateway's log is
+   * readable to any operator with read access. */
+  show(backendId: string, url: string): void {
     if (this.#shown.get(backendId) === url) return;
     this.#shown.set(backendId, url);
-    this.#host.warn(`Agent Hooks Protocol: sign in to ${backendId}: ${url} (valid until ${new Date(expiresAt).toISOString()}; or run \`openclaw ahp login ${backendId}\`)`);
+    this.#host.warn(`Agent Hooks Protocol: sign-in needed for ${backendId}: run \`openclaw ahp login ${backendId}\` on the Gateway's host`);
   }
 
   #ready(backendId: string): void {
@@ -314,13 +371,18 @@ export class Logins {
         const pending = context && await this.pending(context);
         if (!pending || pending.state !== state) continue;
         const { state: _state, ...handle } = pending;
-        await this.#for(backend.id).oauth.complete(handle, callback, budget(DELIVERY_MS));
+        await this.finish(backend.id, handle, callback);
         this.#ready(backend.id);
         this.onLogin?.(backend.id);
         return backend.id;
       }
     }
     throw new AuthError("interaction_required");
+  }
+
+  /** Exchange the callback for the login it answers. */
+  protected async finish(backendId: string, handle: PendingLogin, callback: string): Promise<void> {
+    await this.#for(backendId).oauth.complete(handle, callback, budget(DELIVERY_MS));
   }
 
   /** Cancel a backend's pending login and delete its grant. Its binding stays, so its
