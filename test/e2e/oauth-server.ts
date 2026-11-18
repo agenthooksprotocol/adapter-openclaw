@@ -99,7 +99,8 @@ export class AuthServer {
           const refresh = `ref-${crypto.randomUUID()}`;
           this.tokens.add(token);
           this.#refresh.set(refresh, scope);
-          return Response.json({ access_token: token, token_type: "Bearer", expires_in: 3600, refresh_token: refresh, ...(scope ? { scope } : {}) }, { headers: { "cache-control": "no-store" } });
+          // No scopes are requested here, so `scope` is "": a blank scope means none was given.
+          return Response.json({ access_token: token, token_type: "Bearer", expires_in: 3600, refresh_token: refresh, scope }, { headers: { "cache-control": "no-store" } });
         };
         if (form.get("grant_type") === "authorization_code") {
           const grant = this.#codes.get(form.get("code") ?? "");

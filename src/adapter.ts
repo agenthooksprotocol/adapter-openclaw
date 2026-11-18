@@ -138,9 +138,11 @@ export class Adapter {
       if (!registration) return undefined;
       const hooks = await this.#create(registration);
       for (const issue of hooks.initializationDiagnostics ?? []) {
-        this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}${issue.auth ? ` (${issue.auth.code})` : ""}`);
-        if (issue.auth?.recovery === "login") {
-          this.#logins?.needsLogin(issue.backendId, issue.auth.requiredScopes);
+        this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}${issue.authError ? ` (${issue.authError})` : ""}`);
+        // The SDK tries a backend skipped for want of a login again once a sign-in for it
+        // is prepared in this process.
+        if (issue.recovery === "login") {
+          this.#logins?.needsLogin(issue.backendId, issue.requiredScopes);
           this.#logins?.initializationFailed.add(issue.backendId);
         }
       }
@@ -181,10 +183,6 @@ export class Adapter {
         log: (text) => this.log(text),
         warn: (text) => this.warn(text),
       });
-      // A backend skipped at initialization for want of a login gets its client back.
-      logins.onLogin = (id) => {
-        if (logins.initializationFailed.delete(id)) void this.restart();
-      };
       return (this.#logins = logins);
     } catch (error) {
       this.#loginsUnavailable = true;
@@ -197,14 +195,6 @@ export class Adapter {
   hintLogins(): void {
     if (!this.registration().registration) return;
     void this.logins()?.hint();
-  }
-
-  /** A new client, for a registration that can now initialize in full. */
-  async restart(): Promise<void> {
-    const previous = this.#client;
-    this.#client = undefined;
-    await Promise.allSettled([...this.#inFlight]);
-    await (await previous)?.close();
   }
 
   grants(): Grants {

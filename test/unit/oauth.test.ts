@@ -321,6 +321,16 @@ describe("client selection", () => {
   });
 });
 
+describe("Hooks' re-attempts", () => {
+  test("the provider Hooks gets tells it of prepared sign-ins, for every backend", () => {
+    const provider = logins([{ id: "a", transport: { type: "http", url: "https://hooks.example/a" }, oauth: { issuer: "https://as.example" } }]).provider();
+    expect(typeof provider.onPrepared).toBe("function");
+    const unsubscribe = provider.onPrepared!(() => {});
+    expect(typeof unsubscribe).toBe("function");
+    unsubscribe();
+  });
+});
+
 describe("the callback receiver", () => {
   function response() {
     const sent = { status: 0, headers: {} as Record<string, string>, body: "" };
@@ -404,7 +414,7 @@ describe("logins", () => {
     expect(finished).toEqual(["b"]);
   });
 
-  test("a backend skipped at initialization gets its client back once signed in elsewhere; one that is signed in is not prepared", async () => {
+  test("a backend skipped at initialization is prepared once after a sign-in elsewhere, so Hooks tries it again; otherwise a signed-in backend is not prepared", async () => {
     const prepared: string[] = [];
     const logged: string[] = [];
     class Signed extends Logins {
@@ -412,14 +422,11 @@ describe("logins", () => {
       override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
     const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, livePort: () => undefined, configuredPort: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
-    const restarted: string[] = [];
-    instance.onLogin = (id) => { restarted.push(id); instance.initializationFailed.delete(id); };
     instance.initializationFailed.add("a");
     await instance.hint();
-    expect(restarted).toEqual(["a"]);
+    expect(prepared).toEqual(["a"]);
     await instance.hint();
-    expect(restarted).toEqual(["a"]);
-    expect(prepared).toEqual([]);
+    expect(prepared).toEqual(["a"]);
     expect(logged).toEqual([]);
   });
 

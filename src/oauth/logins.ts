@@ -106,7 +106,8 @@ export class Logins {
   #savedRedirect: string | undefined;
   /** Backends initialization skipped for authentication: their client starts again after a login. */
   readonly initializationFailed = new Set<string>();
-  onLogin?: (backendId: string) => void;
+  /** Hooks' listeners for prepared endpoints, fed by every backend's managed OAuth. */
+  readonly #prepared = new Set<(endpoint: { backendId: string; purpose: "event" | "upload"; url: string }) => void>();
 
   constructor(host: LoginHost) {
     this.#host = host;
@@ -135,6 +136,9 @@ export class Logins {
       loginLifetimeMs: settings.loginLifetimeMs,
     });
     entry = { settings, oauth, route: oauth.provider({ budget: (context) => budget(DELIVERY_MS, context.signal) }) };
+    entry.route.onPrepared?.((endpoint) => {
+      for (const listener of [...this.#prepared]) listener(endpoint);
+    });
     this.#backends.set(id, entry);
     return entry;
   }
@@ -143,6 +147,11 @@ export class Logins {
   readonly #route: DeliveryAuthProvider = {
     credential: (context) => this.#for(context.backendId).route.credential(context),
     challenge: (context) => this.#for(context.backendId).route.challenge(context),
+    // A prepared sign-in lets Hooks try a backend it skipped at initialization again.
+    onPrepared: (listener) => {
+      this.#prepared.add(listener);
+      return () => { this.#prepared.delete(listener); };
+    },
   };
 
   /** Stable per grant: a pending login is reused only for the same redirect. The
@@ -329,9 +338,10 @@ export class Logins {
       work.push((async () => {
         const status = await this.status(backend);
         if (status.state !== "needs-login") {
-          // Signed in elsewhere (`openclaw ahp complete`, a paste): a backend skipped at
-          // initialization gets its client back here too.
-          if (status.state === "authorized" && this.initializationFailed.has(backend.id)) this.onLogin?.(backend.id);
+          // Signed in in another process (`openclaw ahp`): its prepare notified only that
+          // process's Hooks. One prepare here, which finds the grant and makes no request,
+          // lets this Gateway's Hooks try the skipped backend again.
+          if (status.state === "authorized" && this.initializationFailed.delete(backend.id)) await this.login(backend.id);
           return this.#ready(backend.id);
         }
         this.#host.log(`${backend.id}: preparing a sign-in`);
@@ -373,7 +383,7 @@ export class Logins {
         const { state: _state, ...handle } = pending;
         await this.finish(backend.id, handle, callback);
         this.#ready(backend.id);
-        this.onLogin?.(backend.id);
+        this.initializationFailed.delete(backend.id);
         return backend.id;
       }
     }
