@@ -1,8 +1,10 @@
 // Where managed OAuth keeps its records: OpenClaw's plugin state, which the Gateway
-// and the `openclaw ahp` CLI (a separate, short-lived process) share. Tokens and
-// pending logins live in a retained namespace. Client secrets do not: see secrets.ts.
+// and the `openclaw ahp` CLI (a separate, short-lived process) share. Tokens live in
+// a retained namespace. Pending logins, which hold the PKCE verifier, live in a
+// bounded one that expires each with its login: OpenClaw's retained state takes no
+// TTL. Client secrets do not live in either: see secrets.ts.
 import { createHash } from "node:crypto";
-import type { StoredRecord, TokenStore } from "agenthooksprotocol/oauth";
+import { frame, type StoredRecord, type TokenStore } from "agenthooksprotocol/oauth";
 
 /** What this needs of OpenClaw's `PluginStateKeyedStore`. */
 export interface KeyedStore<T> {
@@ -16,6 +18,31 @@ export interface KeyedStore<T> {
     | { operation: "update"; action: "set"; value: T; ttlMs?: number }
     | { operation: "update" | "delete"; action: "keep" }
     | { operation: "delete"; action: "delete" }) => Promise<{ status: "applied" | "unchanged" } | { status: "conflict"; current: { value: T | undefined; comparison: string } }>;
+  entries?: () => Promise<{ key: string; value: T }[]>;
+}
+
+/** A keyed store with compare-and-apply, as every supported OpenClaw has. */
+export type ComparingStore<T> = KeyedStore<T> & Required<Pick<KeyedStore<T>, "observe" | "compareAndApply">>;
+
+/** Marks the sweep below as done, in the namespace it empties. */
+const SWEPT = "swept:agenthooksprotocol-0.14";
+
+/**
+ * On agenthooksprotocol 0.14 and before, pending logins, PKCE verifier and all, were
+ * kept in the retained `records` namespace, keyed by binding, and the Gateway's
+ * redirect in `gateway`. Nothing reads either now: delete them once, so a verifier
+ * is not kept forever. Grants, bindings and registrations stay.
+ */
+export async function sweepLegacy(records: KeyedStore<StoredRecord>, gateway: KeyedStore<string>): Promise<void> {
+  if (!records.entries || !gateway.entries || await gateway.lookup(SWEPT) !== undefined) return;
+  for (const { key, value } of await records.entries()) {
+    // A pending login is written to its own namespace now: one here is the old format.
+    if (value?.kind === "pending_login") await records.delete(key);
+  }
+  for (const { key } of await gateway.entries()) {
+    if (key !== SWEPT) await gateway.delete(key);
+  }
+  await gateway.register(SWEPT, new Date().toISOString());
 }
 
 /** A lease outlives a crashed holder by at most this long. */
@@ -24,6 +51,9 @@ const CONFLICT_RETRIES = 5;
 
 /** SDK keys are long framed strings: the stored key is their digest, and never logged. */
 const digest = (key: string) => createHash("sha256").update(key).digest("hex");
+
+/** The SDK's key prefix for one pending login (by state); its index is another prefix. */
+const PENDING = frame("ahp.oauth.pending:", []);
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -44,18 +74,24 @@ function waitFor(previous: Promise<unknown>, signal: AbortSignal): Promise<void>
 }
 
 /**
- * A `TokenStore` over two plugin-state namespaces: `records` (retained) and `leases`
+ * A `TokenStore` over plugin-state namespaces: `records` (retained), `pending` (bounded,
+ * with expiry; `records` when not given, for a store that takes a TTL) and `leases`
  * (bounded, with expiry). compareAndSet is OpenClaw's observe + compareAndApply on
- * the record's generation. coordinate serializes a key in this process with a
- * promise chain, and across processes with a lease row taken by registerIfAbsent,
- * renewed while the work runs and released when it settles.
+ * the record's generation; a pending login is written with a TTL to its own expiry.
+ * coordinate serializes a key in this process with a promise chain, and across
+ * processes with a lease row taken by registerIfAbsent, renewed while the work runs
+ * and released when it settles.
  */
-export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: KeyedStore<string>, options: { leaseMs?: number; warn?: (text: string) => void } = {}): TokenStore {
+export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: KeyedStore<string>, options: { leaseMs?: number; warn?: (text: string) => void; pending?: KeyedStore<StoredRecord> } = {}): TokenStore {
   const leaseMs = options.leaseMs ?? LEASE_MS;
   const chains = new Map<string, Promise<unknown>>();
-  if (!records.observe || !records.compareAndApply || !leases.observe || !leases.compareAndApply) throw new Error("this OpenClaw has no compare-and-apply plugin state");
-  const observe = records.observe.bind(records), apply = records.compareAndApply.bind(records);
-  const observeLease = leases.observe.bind(leases), applyLease = leases.compareAndApply.bind(leases);
+  const pending = options.pending ?? records;
+  for (const store of [records, pending, leases]) {
+    if (!store.observe || !store.compareAndApply) throw new Error("this OpenClaw has no compare-and-apply plugin state");
+  }
+  /** The namespace a SDK key's record lives in. */
+  const of = (key: string) => key.startsWith(PENDING) ? pending : records;
+  const observeLease = leases.observe!.bind(leases), applyLease = leases.compareAndApply!.bind(leases);
   /** Leases this process holds, by stored key. A lost one commits nothing more. */
   const held = new Map<string, { token: string; lost: boolean }>();
 
@@ -113,20 +149,23 @@ export function keyedTokenStore(records: KeyedStore<StoredRecord>, leases: Keyed
   return {
     async load(key, signal) {
       signal.throwIfAborted();
-      return records.lookup(digest(key));
+      return of(key).lookup(digest(key));
     },
 
     async compareAndSet(key, expected, value, signal) {
       const stored = digest(key);
+      const table = of(key);
+      // A pending login holds the PKCE verifier: it is kept no longer than it is valid.
+      const ttl = value?.kind === "pending_login" ? { ttlMs: Math.max(1, Math.ceil(value.expiresAt - Date.now())) } : {};
       for (let attempt = 0; attempt < CONFLICT_RETRIES; attempt += 1) {
         signal.throwIfAborted();
-        const seen = await observe(stored);
+        const seen = await table.observe!(stored);
         if (seen.value?.generation !== expected) return false;
         signal.throwIfAborted();
         // The generation, not the lease, decides: a newer holder's write changes it.
         await checkHeld(stored);
-        const result = await apply(stored, seen.comparison, value !== undefined
-          ? { operation: "update", action: "set", value }
+        const result = await table.compareAndApply!(stored, seen.comparison, value !== undefined
+          ? { operation: "update", action: "set", value, ...ttl }
           : seen.value === undefined ? { operation: "delete", action: "keep" } : { operation: "delete", action: "delete" });
         // A conflict may be storage metadata only: look again at the generation.
         if (result.status !== "conflict") return true;

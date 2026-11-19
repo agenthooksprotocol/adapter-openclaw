@@ -7,9 +7,9 @@ import { capabilitiesFor, gaps, MAX_CONTINUATIONS, narrow, type Grants } from ".
 import { join } from "node:path";
 import type { StoredRecord } from "agenthooksprotocol/oauth";
 import { loadRegistration, stateDir, type LoadedRegistration } from "./config.js";
-import { configuredPort, Logins, type PluginSettings } from "./oauth/logins.js";
+import { configuredPort, Logins, type Completion, type PluginSettings } from "./oauth/logins.js";
 import { fileSecretStore } from "./oauth/secrets.js";
-import { keyedTokenStore, type KeyedStore } from "./oauth/store.js";
+import { keyedTokenStore, sweepLegacy, type ComparingStore, type KeyedStore } from "./oauth/store.js";
 import type { Message, NativeMessage } from "./content.js";
 import { describe, type AnyResult } from "./effects.js";
 
@@ -117,8 +117,6 @@ export class Adapter {
   #logins: Logins | undefined;
   /** Sign-in could not start here: said once. */
   #loginsUnavailable = false;
-  /** The Gateway's port, once it has started. */
-  port: number | undefined;
   /** Deliveries under way, in every session. */
   readonly #inFlight = new Set<Promise<unknown>>();
   /** Where a tool that reports no session goes. */
@@ -142,7 +140,7 @@ export class Adapter {
         // The SDK tries a backend skipped for want of a login again once a sign-in for it
         // is prepared in this process.
         if (issue.recovery === "login") {
-          this.#logins?.needsLogin(issue.backendId, issue.requiredScopes);
+          void this.#logins?.needsLogin(issue.backendId, issue.requiredScopes);
           this.#logins?.initializationFailed.add(issue.backendId);
         }
       }
@@ -167,18 +165,23 @@ export class Adapter {
       const settings = (this.api.pluginConfig ?? {}) as PluginSettings;
       const environment = process.env;
       const { state } = this.api.runtime;
-      const redirects = state.openKeyedStore<string>({ namespace: "ahp-oauth-gateway", retention: "retained" }) as unknown as KeyedStore<string>;
       const records = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth", retention: "retained" }) as unknown as KeyedStore<StoredRecord>;
       const leases = state.openKeyedStore<string>({ namespace: "ahp-oauth-leases", maxEntries: 10_000 }) as unknown as KeyedStore<string>;
+      // Retained state takes no TTL: pending logins expire here, each with its login.
+      const pending = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth-pending", maxEntries: 10_000 }) as unknown as KeyedStore<StoredRecord>;
+      const stepUps = state.openKeyedStore<string>({ namespace: "ahp-oauth-step-up", retention: "retained" }) as unknown as ComparingStore<string>;
+      const legacy = state.openKeyedStore<string>({ namespace: "ahp-oauth-gateway", retention: "retained" }) as unknown as KeyedStore<string>;
+      void sweepLegacy(records, legacy).catch((error) => this.warn(`Agent Hooks Protocol: could not delete sign-ins left by an earlier version (${describe(error)})`));
       const directory = join(stateDir(environment) ?? state.resolveStateDir(), "plugins", PLUGIN_ID, "oauth-secrets");
       const logins = new Logins({
-        store: keyedTokenStore(records, leases, { warn: (text) => this.warn(text) }),
+        store: keyedTokenStore(records, leases, { pending, warn: (text) => this.warn(text) }),
+        stepUps,
+        // Completed logins expire with the pending ones, in their namespace.
+        completions: pending as unknown as KeyedStore<Completion>,
         secrets: Logins.secrets(fileSecretStore(directory), settings, environment),
         settings,
         environment,
-        livePort: () => this.port,
-        configuredPort: () => configuredPort(this.api.config as never, environment),
-        redirects,
+        port: () => configuredPort(this.api.config as never, environment),
         backends: () => (this.registration().registration?.hooks ?? []) as never,
         log: (text) => this.log(text),
         warn: (text) => this.warn(text),
@@ -191,7 +194,7 @@ export class Adapter {
     }
   }
 
-  /** At the start of a turn: links for backends that need a sign-in, in the background. */
+  /** At the start of a turn, in the background: a Gateway log line for each backend that needs a sign-in. */
   hintLogins(): void {
     if (!this.registration().registration) return;
     void this.logins()?.hint();
@@ -347,7 +350,7 @@ export class Adapter {
     for (const diagnostic of result.diagnostics) {
       const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}${diagnostic.auth ? ` (${diagnostic.auth.code})` : ""}`;
       // Shown at the next turn's start: a delivery never starts a login itself.
-      if (diagnostic.auth?.recovery === "login") this.#logins?.needsLogin(diagnostic.backendId, diagnostic.auth.requiredScopes);
+      if (diagnostic.auth?.recovery === "login") void this.#logins?.needsLogin(diagnostic.backendId, diagnostic.auth.requiredScopes);
       if (diagnostic.syntheticDenial) this.warn(`${line} (denied by failure policy)`);
       else this.log(line);
     }
