@@ -176,6 +176,8 @@ export class Adapter {
       const logins = new Logins({
         store: keyedTokenStore(records, leases, { pending, warn: (text) => this.warn(text) }),
         stepUps,
+        // Completed logins expire with the pending ones, in their namespace.
+        completions: pending as unknown as KeyedStore<string>,
         secrets: Logins.secrets(fileSecretStore(directory), settings, environment),
         settings,
         environment,

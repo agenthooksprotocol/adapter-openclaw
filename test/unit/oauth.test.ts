@@ -293,6 +293,7 @@ function logins(backends: Record<string, unknown>[], settings = {}, extra: Parti
   const host: LoginHost = {
     store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()),
     stepUps: new Table<string>(),
+    completions: new Table<string>(),
     secrets: fileSecretStore(join(dir, "s")),
     settings: { secrets: { "the-secret": "shh" }, ...settings },
     environment: {},
@@ -437,7 +438,7 @@ describe("logins", () => {
       override async status() { return { state: "authorized" as const }; }
       override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
-    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
+    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), completions: new Table<string>(), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
     instance.initializationFailed.add("a");
     await instance.hint();
     expect(prepared).toEqual(["a"]);
@@ -454,7 +455,7 @@ describe("logins", () => {
       override async status() { return { state }; }
       override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
-    const instance = new Waiting({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
+    const instance = new Waiting({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), completions: new Table<string>(), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
     await instance.hint();
     await instance.hint();
     state = "authorized";
@@ -476,14 +477,14 @@ describe("logout", () => {
     await store.compareAndSet(bindingKey("openclaw", context), undefined, { kind: "binding", generation: "b", issuer: "https://as.example", resource: "https://hooks.example/a", discoveredAt: Date.now(), grantKey: "k" }, signal());
     // An index naming a login that has expired: nothing to cancel.
     await store.compareAndSet(frame("ahp.oauth.pending-index:", ["k"]), undefined, { kind: "pending_index", generation: "i", states: ["expired"] }, signal());
-    expect(await instance.logout("a")).toBe(false);
+    expect(await instance.logout("a")).toEqual({ signedOut: false, forgotScopes: false });
     const pending = { kind: "pending_login", generation: "p", state: "live", grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: "https://as.example/authorize?state=live", verifier: "v", client: {} as never, metadata: {} as never, context, source: "dcr" } as StoredRecord;
     await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "live"]), undefined, pending, signal());
     const index = await store.load(frame("ahp.oauth.pending-index:", ["k"]), signal());
     await store.compareAndSet(frame("ahp.oauth.pending-index:", ["k"]), index?.generation, { kind: "pending_index", generation: "j", states: ["live"] }, signal());
-    expect(await instance.logout("a")).toBe(true);
+    expect(await instance.logout("a")).toEqual({ signedOut: true, forgotScopes: false });
     expect(await store.load(frame("ahp.oauth.pending:", ["openclaw", "live"]), signal())).toBeUndefined();
-    expect(await instance.logout("a")).toBe(false);
+    expect(await instance.logout("a")).toEqual({ signedOut: false, forgotScopes: false });
   });
 });
 
@@ -548,19 +549,28 @@ describe("step-up", () => {
       return {
         prepare: async (_context: unknown, _budget: unknown, options: { requiredScopes?: readonly string[] }) => {
           this.prepared.push(options.requiredScopes);
-          // Settings that no longer allow a scope asked for.
-          if (options.requiredScopes?.some((scope) => !this.allowed.includes(scope))) throw new AuthError("access_denied");
+          // An issuer the settings do not trust: refused, naming no scopes.
+          if (this.untrustedIssuer) throw new AuthError("access_denied");
+          // Settings that no longer allow a scope asked for: the SDK names them.
+          const refused = options.requiredScopes?.filter((scope) => !this.allowed.includes(scope)) ?? [];
+          if (refused.length) throw new AuthError("access_denied", refused);
           return this.ready ? { type: "ready" } : { type: "pending_login", state: "s", authorizationUrl: "https://as.example/authorize?state=s", expiresAt: Date.now() + 60_000 };
         },
-        complete: async () => ({ type: "ready" }),
+        complete: async () => {
+          // Consent refused: the SDK deletes the pending login before it would exchange.
+          if (this.denied) throw new AuthError("access_denied");
+          return { type: "ready" };
+        },
       } as never;
     }
     ready = false;
+    denied = false;
+    untrustedIssuer = false;
     allowed = ["hooks:read", "hooks:write", "hooks:admin"];
   }
   const pendingLogin = (state: string, requiredScopes: string[]): StoredRecord => ({ kind: "pending_login", generation: "g", state, grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: `https://as.example/authorize?state=${state}`, verifier: "v", client: { requiredScopes } as never, metadata: {} as never, context: { backendId: "a", purpose: "event", url: "https://hooks.example/a" }, source: "dcr" } as StoredRecord);
-  const shared = () => ({ records: new Table<StoredRecord>(), stepUps: new Table<string>() });
-  const open = (state: ReturnType<typeof shared>, warn: (text: string) => void = () => {}) => new Process({ store: keyedTokenStore(state.records, new Table<string>()), stepUps: state.stepUps, secrets: fileSecretStore(join(dir, "s5")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend] as never, log: () => {}, warn });
+  const shared = () => ({ records: new Table<StoredRecord>(), stepUps: new Table<string>(), completions: new Table<string>() });
+  const open = (state: ReturnType<typeof shared>, warn: (text: string) => void = () => {}) => new Process({ store: keyedTokenStore(state.records, new Table<string>()), stepUps: state.stepUps, completions: state.completions, secrets: fileSecretStore(join(dir, "s5")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend] as never, log: () => {}, warn });
 
   test("scopes a Gateway delivery asked for reach `openclaw ahp login` in another process, which prepares a step-up", async () => {
     const state = shared();
@@ -621,11 +631,39 @@ describe("step-up", () => {
     expect(await cli.finished(backend as never, login as never)).toBe(false);
     expect(await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s")).toBe("a");
     expect(await cli.stepUp("a")).toEqual(["hooks:admin"]);
-    // The SDK's completion consumes the pending login.
-    await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), "g", undefined, signal());
     expect(await cli.finished(backend as never, login as never)).toBe(true);
-    // An expired link, its scopes still asked for, has not finished.
-    expect(await cli.finished(backend as never, { state: "s", requiredScopes: ["hooks:admin"] })).toBe(false);
+    // Another login is not finished by it.
+    expect(await cli.finished(backend as never, { state: "t" })).toBe(false);
+  });
+
+  test("a sign-in finishes on its completion even if a delivery asks for its own scopes again", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    await gateway.needsLogin("a", ["hooks:write"]);
+    const login = await cli.login("a");
+    await keyedTokenStore(state.records, new Table<string>()).compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), undefined, pendingLogin("s", ["hooks:write"]), signal());
+    await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s");
+    // A delivery with a token from before the sign-in is refused, and asks again.
+    await gateway.needsLogin("a", ["hooks:write"]);
+    expect(await cli.status(backend as never)).toMatchObject({ state: "needs-login", scopes: ["hooks:write"] });
+    expect(await cli.finished(backend as never, login as never)).toBe(true);
+  });
+
+  test("a sign-in refused at consent never looks finished, whatever else is asked for", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    await gateway.needsLogin("a", ["hooks:write"]);
+    const login = await cli.login("a");
+    const store = keyedTokenStore(state.records, new Table<string>());
+    await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), undefined, pendingLogin("s", ["hooks:write"]), signal());
+    await gateway.needsLogin("a", ["hooks:admin"]);
+    gateway.denied = true;
+    await expect(gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?error=access_denied&state=s")).rejects.toMatchObject({ code: "access_denied" });
+    // Its pending login is gone, and none of what is still asked for is its own.
+    await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), "g", undefined, signal());
+    await gateway.needsLogin("a", ["hooks:read"]);
+    expect(await cli.finished(backend as never, login as never)).toBe(false);
+    expect(state.completions.rows.size).toBe(0);
   });
 
   test("scopes the backend's settings no longer allow say how to recover, and logout forgets them", async () => {
@@ -637,10 +675,21 @@ describe("step-up", () => {
     await expect(refused).rejects.toThrow("asked for scopes its OAuth settings do not allow (hooks:admin)");
     await expect(refused).rejects.toThrow("openclaw ahp logout a");
     // Nothing else is stored: the step-up alone is what logout removes.
-    expect(await cli.logout("a")).toBe(true);
+    expect(await cli.logout("a")).toEqual({ signedOut: false, forgotScopes: true });
     expect(state.stepUps.rows.size).toBe(0);
     expect(await cli.login("a")).toMatchObject({ type: "pending", requiredScopes: [] });
-    expect(await cli.logout("a")).toBe(false);
+    expect(await cli.logout("a")).toEqual({ signedOut: false, forgotScopes: false });
+  });
+
+  test("a refusal that names no scopes, as of an untrusted issuer, is not blamed on the step-up", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    await gateway.needsLogin("a", ["hooks:admin"]);
+    cli.untrustedIssuer = true;
+    const refused = cli.login("a");
+    await expect(refused).rejects.toBeInstanceOf(AuthError);
+    await expect(refused).rejects.toMatchObject({ code: "access_denied", message: "Authentication failed: access_denied" });
+    expect(await cli.stepUp("a")).toEqual(["hooks:admin"]);
   });
 
   test("a sign-in a 401 asked for, with no scopes, keeps nothing", async () => {

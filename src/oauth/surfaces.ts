@@ -39,6 +39,11 @@ export function callbackRoute(logins: () => Logins) {
   };
 }
 
+function logoutText(result: { signedOut: boolean; forgotScopes: boolean }): string {
+  if (result.signedOut) return result.forgotScopes ? "signed out, and forgot the scopes it asked for" : "signed out";
+  return result.forgotScopes ? "was not signed in; forgot the scopes it asked for" : "was not signed in";
+}
+
 export function describeStatus(status: Status, withLink: boolean): string {
   switch (status.state) {
     case "authorized": return "authorized";
@@ -83,7 +88,7 @@ export function chatCommand(logins: () => Logins, backends: () => { id: string }
         }));
         return { text: lines.join("\n") };
       }
-      if (verb === "logout" && id) return { text: (await current.logout(id)) ? `${id}: signed out` : `${id}: was not signed in` };
+      if (verb === "logout" && id) return { text: `${id}: ${logoutText(await current.logout(id))}` };
     } catch (error) {
       return { text: `Agent Hooks Protocol: ${error instanceof AuthError ? error.code : error instanceof Error ? error.message : String(error)}` };
     }
@@ -144,7 +149,7 @@ export function cliCommands(program: Command, logins: () => Logins, backends: ()
       console.log(`${await logins().complete(url)}: signed in`);
     });
   ahp.command("logout").argument("<backend>").description("Cancel a backend's sign-in and delete its tokens").action(async (id: string) => {
-    console.log((await logins().logout(id)) ? `${id}: signed out` : `${id}: was not signed in`);
+    console.log(`${id}: ${logoutText(await logins().logout(id))}`);
   });
 }
 
