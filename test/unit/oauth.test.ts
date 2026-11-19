@@ -4,7 +4,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthError } from "agenthooksprotocol/client";
-import { bindingKey, frame, type StoredRecord } from "agenthooksprotocol/oauth";
+import { bindingKey, frame, managedOAuth, type StoredRecord } from "agenthooksprotocol/oauth";
 import { configuredPort, Logins, type LoginHost } from "../../src/oauth/logins";
 import { privateAddress } from "../../src/oauth/network";
 import { fileSecretStore, resolveSecret } from "../../src/oauth/secrets";
@@ -690,6 +690,46 @@ describe("step-up", () => {
     await expect(refused).rejects.toBeInstanceOf(AuthError);
     await expect(refused).rejects.toMatchObject({ code: "access_denied", message: "Authentication failed: access_denied" });
     expect(await cli.stepUp("a")).toEqual(["hooks:admin"]);
+  });
+
+  test("through the SDK: a step-up for a scope outside the backend's `oauth.scopes` names it, and says how to recover", async () => {
+    const real = { id: "a", transport: { type: "http", url: "https://hooks.example/a" }, oauth: { issuer: "https://as.example", clientId: "openclaw", scopes: ["hooks:read", "hooks:write"] } };
+    /** The backend and its authorization server, as their metadata says: nothing else is faked. */
+    const served = (url: string): Response => {
+      const { origin, pathname } = new URL(url);
+      if (origin === "https://hooks.example" && pathname.startsWith("/.well-known/oauth-protected-resource")) {
+        return Response.json({ resource: "https://hooks.example/a", authorization_servers: ["https://as.example"], scopes_supported: ["hooks:read", "hooks:write", "hooks:admin"] });
+      }
+      if (origin === "https://as.example" && pathname === "/.well-known/oauth-authorization-server") {
+        return Response.json({ issuer: "https://as.example", authorization_endpoint: "https://as.example/authorize", token_endpoint: "https://as.example/token", response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none"] });
+      }
+      if (origin === "https://hooks.example") return new Response(null, { status: 401, headers: { "www-authenticate": 'Bearer resource_metadata="https://hooks.example/.well-known/oauth-protected-resource/a"' } });
+      return new Response(null, { status: 404 });
+    };
+    class Sdk extends Logins {
+      override managed() {
+        return managedOAuth({
+          namespace: "openclaw",
+          store: this.host.store,
+          secrets: this.host.secrets,
+          policyFetch: async (url) => served(url),
+          checkDestination: () => {},
+          selectClient: (issuers, resource, context) => this.selectClient(issuers, resource, context),
+          persistPendingLogins: true,
+        });
+      }
+      constructor(readonly host: LoginHost) { super(host); }
+    }
+    const state = shared();
+    const host: LoginHost = { store: keyedTokenStore(state.records, new Table<string>(), { pending: new Table<StoredRecord>() }), stepUps: state.stepUps, completions: state.completions, secrets: fileSecretStore(join(dir, "s6")), settings: {}, environment: {}, port: () => 18789, backends: () => [real] as never, log: () => {}, warn: () => {} };
+    const cli = new Sdk(host);
+    // Within what the backend may be granted, the SDK prepares a login.
+    expect(await cli.login("a")).toMatchObject({ type: "pending", requiredScopes: [] });
+    const gateway = new Sdk(host);
+    await gateway.needsLogin("a", ["hooks:admin"]);
+    const refused = new Sdk(host).login("a");
+    await expect(refused).rejects.toThrow("a asked for scopes its OAuth settings do not allow (hooks:admin): run `openclaw ahp logout a`");
+    await expect(refused).rejects.toMatchObject({ cause: { code: "access_denied", requiredScopes: ["hooks:admin"] } });
   });
 
   test("a sign-in a 401 asked for, with no scopes, keeps nothing", async () => {

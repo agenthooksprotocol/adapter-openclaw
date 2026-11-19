@@ -43,7 +43,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "agenthooksprotocol": "0.15.0"
+    "agenthooksprotocol": "0.16.0"
   },
   "peerDependencies": {
     "openclaw": ">=2026.9.36"
