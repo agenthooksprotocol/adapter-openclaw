@@ -45,9 +45,13 @@ export type Status =
   | { state: "authorized" }
   | { state: "client-credentials" }
   | { state: "bearer" }
-  | { state: "needs-login"; url?: string; expiresAt?: number; scopes?: readonly string[] }
+  | { state: "needs-login"; scopes?: readonly string[] }
   | { state: "failing"; reason: string }
   | { state: "not-configured" };
+
+/** A login's outcome, kept briefly for the `openclaw ahp login` waiting on it:
+ * "completed", or the code it failed with. */
+export type Completion = { backendId: string; outcome: string };
 
 export interface LoginHost {
   store: TokenStore;
@@ -55,9 +59,9 @@ export interface LoginHost {
    * with the CLI, which signs in for them. Changed only by compare-and-apply: the
    * Gateway and the CLI both write it. */
   stepUps: ComparingStore<string>;
-  /** Logins completed, by digest of their state, holding the backend id: rows that
-   * expire soon after. `openclaw ahp login` reads them, whichever process completed it. */
-  completions: KeyedStore<string>;
+  /** Logins completed or failed, by digest of their state: rows that expire soon
+   * after. `openclaw ahp login` reads them, whichever process completed it. */
+  completions: KeyedStore<Completion>;
   secrets: SecretStore;
   settings: PluginSettings;
   environment: Record<string, string | undefined>;
@@ -365,8 +369,7 @@ export class Logins {
         // Signed in, but not for what a delivery has since asked for.
         const scopes = await this.stepUp(backend.id);
         if (!scopes.length) return { state: "authorized" };
-        const link = this.#link(backend.id);
-        return { state: "needs-login", scopes, ...(link ? { url: link.authorizationUrl, expiresAt: link.expiresAt } : {}) };
+        return { state: "needs-login", scopes };
       }
       // Nothing stored: a backend set up for sign-in has not been signed in to.
       if (kind === "none" && !this.#needed.has(backend.id)) return { state: "not-configured" };
@@ -375,8 +378,7 @@ export class Logins {
       if (!(error instanceof AuthError) || error.recovery !== "login") return { state: "failing", reason: describe(error) };
     }
     if (kind === "none") return { state: "failing", reason: "it asks for OAuth: give it an `oauth` object in hooks.json" };
-    const link = this.#link(backend.id);
-    return { state: "needs-login", ...(link ? { url: link.authorizationUrl, expiresAt: link.expiresAt } : {}) };
+    return { state: "needs-login" };
   }
 
   /** Start a backend's login, or reuse the one this process started. Ready when its grant is usable. */
@@ -420,13 +422,15 @@ export class Logins {
     return { type: "pending", url: link.authorizationUrl, expiresAt: link.expiresAt, state: link.state, requiredScopes: link.requiredScopes };
   }
 
-  /** Whether the login `login` returned has completed, in whichever process: the
-   * backend is authorized, or that login's completion was recorded. A step-up the
-   * Gateway recorded since does not make it look unfinished, and a login that was
-   * refused, evicted or expired never looks finished. */
-  async finished(backend: Backend, login: { state: string }): Promise<boolean> {
-    if ((await this.status(backend)).state === "authorized") return true;
-    return (await this.#host.completions.lookup(completionKey(login.state))) === backend.id;
+  /** Where the login `login` returned is, in whichever process: completed (the backend
+   * is authorized, or its completion was recorded), failed (a refused consent or code
+   * exchange, with its code), or still pending. A step-up the Gateway recorded since
+   * does not make a completed login look unfinished. */
+  async finished(backend: Backend, login: { state: string }): Promise<{ state: "completed" | "pending" } | { state: "failed"; code: string }> {
+    if ((await this.status(backend)).state === "authorized") return { state: "completed" };
+    const recorded = await this.#host.completions.lookup(completionKey(login.state));
+    if (recorded?.backendId !== backend.id) return { state: "pending" };
+    return recorded.outcome === "completed" ? { state: "completed" } : { state: "failed", code: recorded.outcome };
   }
 
   /** The backends to sign in to: every HTTP backend that needs it, never one with a usable grant. */
@@ -457,7 +461,7 @@ export class Logins {
         // Hooks. One prepare here finds the grant without a request, and lets this
         // Gateway's Hooks try the skipped backend again.
         if (status.state === "authorized" && this.initializationFailed.has(backend.id)) {
-          await this.login(backend.id);
+          if (!(await this.#resume(backend))) return this.show(backend.id);
           this.initializationFailed.delete(backend.id);
         }
         this.#ready(backend.id);
@@ -469,6 +473,17 @@ export class Logins {
       }).finally(() => this.#checking.delete(backend.id)));
     }
     return Promise.all(work).then(() => {});
+  }
+
+  /** Prepare a backend for the stored grant alone, asking for no scopes, so Hooks
+   * tries it again. A login it would start anyway is cancelled: the Gateway shows no
+   * link. False when the grant was not enough. */
+  async #resume(backend: Backend): Promise<boolean> {
+    const managed = this.managed(backend.id);
+    const result = await managed.prepare(this.context(backend)!, budget(PREPARE_MS), { redirectUri: this.redirectUri });
+    if (result.type === "ready") return true;
+    await managed.cancel(result, budget(DELIVERY_MS));
+    return false;
   }
 
   /** In the Gateway log: that a backend needs a sign-in, once until it is signed in. */
@@ -491,14 +506,21 @@ export class Logins {
     const record = state ? await this.#host.store.load(pendingKey(state), AbortSignal.timeout(DELIVERY_MS)) : undefined;
     const backendId = record?.kind === "pending_login" ? record.context.backendId : undefined;
     if (!backendId || !this.backend(backendId)) throw new AuthError("interaction_required");
-    await this.managed(backendId).complete(callback, budget(DELIVERY_MS));
+    // For `openclaw ahp login`, which waits on this login, whichever process it runs in.
+    const ttlMs = Math.max(0, (record?.kind === "pending_login" ? record.expiresAt : Date.now()) - Date.now()) + COMPLETION_MS;
+    const recordOutcome = (outcome: string) => this.#host.completions.register(completionKey(state!), { backendId, outcome }, { ttlMs })
+      .catch((error) => this.#host.warn(`Agent Hooks Protocol: ${backendId}: could not record how its sign-in ended (${describe(error)})`));
+    try {
+      await this.managed(backendId).complete(callback, budget(DELIVERY_MS));
+    } catch (error) {
+      // Refused consent or a failed exchange: the waiting CLI stops, and says why.
+      await recordOutcome(describe(error));
+      throw error;
+    }
     // Completed: the grant covers the scopes this login required.
     await this.#steppedUp(backendId, record?.kind === "pending_login" ? record.client.requiredScopes ?? [] : []);
-    // For `openclaw ahp login`, which waits on this login, whichever process it runs in:
-    // only now, so the step-up it sees next holds only what was asked for since.
-    const ttlMs = Math.max(0, (record?.kind === "pending_login" ? record.expiresAt : Date.now()) - Date.now()) + COMPLETION_MS;
-    await this.#host.completions.register(completionKey(state!), backendId, { ttlMs })
-      .catch((error) => this.#host.warn(`Agent Hooks Protocol: ${backendId}: signed in, but could not record it (${describe(error)})`));
+    // Only now, so the step-up the CLI sees next holds only what was asked for since.
+    await recordOutcome("completed");
     this.#ready(backendId);
     this.initializationFailed.delete(backendId);
     return backendId;

@@ -7,7 +7,7 @@ import { capabilitiesFor, gaps, MAX_CONTINUATIONS, narrow, type Grants } from ".
 import { join } from "node:path";
 import type { StoredRecord } from "agenthooksprotocol/oauth";
 import { loadRegistration, stateDir, type LoadedRegistration } from "./config.js";
-import { configuredPort, Logins, type PluginSettings } from "./oauth/logins.js";
+import { configuredPort, Logins, type Completion, type PluginSettings } from "./oauth/logins.js";
 import { fileSecretStore } from "./oauth/secrets.js";
 import { keyedTokenStore, sweepLegacy, type ComparingStore, type KeyedStore } from "./oauth/store.js";
 import type { Message, NativeMessage } from "./content.js";
@@ -177,7 +177,7 @@ export class Adapter {
         store: keyedTokenStore(records, leases, { pending, warn: (text) => this.warn(text) }),
         stepUps,
         // Completed logins expire with the pending ones, in their namespace.
-        completions: pending as unknown as KeyedStore<string>,
+        completions: pending as unknown as KeyedStore<Completion>,
         secrets: Logins.secrets(fileSecretStore(directory), settings, environment),
         settings,
         environment,
@@ -194,7 +194,7 @@ export class Adapter {
     }
   }
 
-  /** At the start of a turn: links for backends that need a sign-in, in the background. */
+  /** At the start of a turn, in the background: a Gateway log line for each backend that needs a sign-in. */
   hintLogins(): void {
     if (!this.registration().registration) return;
     void this.logins()?.hint();

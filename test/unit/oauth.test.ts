@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthError } from "agenthooksprotocol/client";
 import { bindingKey, frame, managedOAuth, type StoredRecord } from "agenthooksprotocol/oauth";
-import { configuredPort, Logins, type LoginHost } from "../../src/oauth/logins";
+import { configuredPort, Logins, type Completion, type LoginHost } from "../../src/oauth/logins";
 import { privateAddress } from "../../src/oauth/network";
 import { fileSecretStore, resolveSecret } from "../../src/oauth/secrets";
 import { backendSettings, trustedIssuer } from "../../src/oauth/settings";
@@ -293,7 +293,7 @@ function logins(backends: Record<string, unknown>[], settings = {}, extra: Parti
   const host: LoginHost = {
     store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()),
     stepUps: new Table<string>(),
-    completions: new Table<string>(),
+    completions: new Table<Completion>(),
     secrets: fileSecretStore(join(dir, "s")),
     settings: { secrets: { "the-secret": "shh" }, ...settings },
     environment: {},
@@ -384,6 +384,15 @@ describe("the callback receiver", () => {
     expect(res.sent.headers["cache-control"]).toBe("no-store");
   });
 
+  test("keeps a publicUrl's path prefix, which a proxy stripped, taking only the query from the request", async () => {
+    let seen = "";
+    const behindProxy = callbackRoute(() => ({ redirectUri: "https://gw.example/openclaw/ahp/oauth/callback", complete: async (url: string) => { seen = url; return "a"; } } as never));
+    const res = response();
+    await behindProxy({ method: "GET", url: "/ahp/oauth/callback?code=c&state=s" } as never, res as never);
+    expect(seen).toBe("https://gw.example/openclaw/ahp/oauth/callback?code=c&state=s");
+    expect(res.sent.status).toBe(200);
+  });
+
   test("a spent or unknown callback says so, and only GET is answered", async () => {
     const res = response();
     await receiver(async () => { throw new AuthError("interaction_required"); })({ method: "GET", url: "/ahp/oauth/callback?state=x" } as never, res as never);
@@ -436,15 +445,42 @@ describe("logins", () => {
     const logged: string[] = [];
     class Signed extends Logins {
       override async status() { return { state: "authorized" as const }; }
-      override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
+      override managed(id: string) { return { prepare: async () => { prepared.push(id); return { type: "ready" }; } } as never; }
     }
-    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), completions: new Table<string>(), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
+    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), completions: new Table<Completion>(), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
     instance.initializationFailed.add("a");
     await instance.hint();
     expect(prepared).toEqual(["a"]);
     await instance.hint();
     expect(prepared).toEqual(["a"]);
     expect(logged).toEqual([]);
+  });
+
+  test("resuming a skipped backend asks for no scopes, and a login it would start is cancelled, with only a hint", async () => {
+    const asked: unknown[] = [];
+    const cancelled: string[] = [];
+    const warnings: string[] = [];
+    class Signed extends Logins {
+      override async status() { return { state: "authorized" as const }; }
+      override managed() {
+        return {
+          prepare: async (_context: unknown, _budget: unknown, options: unknown) => {
+            asked.push(options);
+            return { type: "pending_login", state: "s", authorizationUrl: "https://as.example/authorize?state=s", expiresAt: Date.now() + 60_000 };
+          },
+          cancel: async (pending: { state: string }) => { cancelled.push(pending.state); },
+        } as never;
+      }
+    }
+    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), completions: new Table<Completion>(), secrets: fileSecretStore(join(dir, "s7")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
+    // Scopes this process saw asked for, since signed in for elsewhere.
+    await instance.needsLogin("a", ["hooks:admin"]);
+    instance.initializationFailed.add("a");
+    await instance.hint();
+    expect(asked).toEqual([{ redirectUri: "http://127.0.0.1:18789/ahp/oauth/callback" }]);
+    expect(cancelled).toEqual(["s"]);
+    expect(instance.initializationFailed.has("a")).toBe(true);
+    expect(warnings).toEqual(["Agent Hooks Protocol: sign-in needed for a: run `openclaw ahp login a` on the Gateway's host"]);
   });
 
   test("the Gateway log says a sign-in is needed once until it is signed in, never with a link, and prepares none", async () => {
@@ -455,7 +491,7 @@ describe("logins", () => {
       override async status() { return { state }; }
       override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
-    const instance = new Waiting({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), completions: new Table<string>(), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
+    const instance = new Waiting({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), completions: new Table<Completion>(), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
     await instance.hint();
     await instance.hint();
     state = "authorized";
@@ -569,7 +605,7 @@ describe("step-up", () => {
     allowed = ["hooks:read", "hooks:write", "hooks:admin"];
   }
   const pendingLogin = (state: string, requiredScopes: string[]): StoredRecord => ({ kind: "pending_login", generation: "g", state, grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: `https://as.example/authorize?state=${state}`, verifier: "v", client: { requiredScopes } as never, metadata: {} as never, context: { backendId: "a", purpose: "event", url: "https://hooks.example/a" }, source: "dcr" } as StoredRecord);
-  const shared = () => ({ records: new Table<StoredRecord>(), stepUps: new Table<string>(), completions: new Table<string>() });
+  const shared = () => ({ records: new Table<StoredRecord>(), stepUps: new Table<string>(), completions: new Table<Completion>() });
   const open = (state: ReturnType<typeof shared>, warn: (text: string) => void = () => {}) => new Process({ store: keyedTokenStore(state.records, new Table<string>()), stepUps: state.stepUps, completions: state.completions, secrets: fileSecretStore(join(dir, "s5")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend] as never, log: () => {}, warn });
 
   test("scopes a Gateway delivery asked for reach `openclaw ahp login` in another process, which prepares a step-up", async () => {
@@ -628,12 +664,12 @@ describe("step-up", () => {
     await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), undefined, pendingLogin("s", ["hooks:write"]), signal());
     // While the link is open, a delivery asks for more.
     await gateway.needsLogin("a", ["hooks:admin"]);
-    expect(await cli.finished(backend as never, login as never)).toBe(false);
+    expect(await cli.finished(backend as never, login as never)).toEqual({ state: "pending" });
     expect(await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s")).toBe("a");
     expect(await cli.stepUp("a")).toEqual(["hooks:admin"]);
-    expect(await cli.finished(backend as never, login as never)).toBe(true);
+    expect(await cli.finished(backend as never, login as never)).toEqual({ state: "completed" });
     // Another login is not finished by it.
-    expect(await cli.finished(backend as never, { state: "t" })).toBe(false);
+    expect(await cli.finished(backend as never, { state: "t" })).toEqual({ state: "pending" });
   });
 
   test("a completion is recorded only after the scopes it answers are cleared", async () => {
@@ -651,7 +687,7 @@ describe("step-up", () => {
     };
     await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s");
     expect(seen).toEqual([[]]);
-    expect(await cli.finished(backend as never, login as never)).toBe(true);
+    expect(await cli.finished(backend as never, login as never)).toEqual({ state: "completed" });
   });
 
   test("a sign-in finishes on its completion even if a delivery asks for its own scopes again", async () => {
@@ -664,10 +700,10 @@ describe("step-up", () => {
     // A delivery with a token from before the sign-in is refused, and asks again.
     await gateway.needsLogin("a", ["hooks:write"]);
     expect(await cli.status(backend as never)).toMatchObject({ state: "needs-login", scopes: ["hooks:write"] });
-    expect(await cli.finished(backend as never, login as never)).toBe(true);
+    expect(await cli.finished(backend as never, login as never)).toEqual({ state: "completed" });
   });
 
-  test("a sign-in refused at consent never looks finished, whatever else is asked for", async () => {
+  test("a sign-in refused at consent is reported as refused, whatever else is asked for", async () => {
     const state = shared();
     const gateway = open(state), cli = open(state);
     await gateway.needsLogin("a", ["hooks:write"]);
@@ -680,8 +716,8 @@ describe("step-up", () => {
     // Its pending login is gone, and none of what is still asked for is its own.
     await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), "g", undefined, signal());
     await gateway.needsLogin("a", ["hooks:read"]);
-    expect(await cli.finished(backend as never, login as never)).toBe(false);
-    expect(state.completions.rows.size).toBe(0);
+    // The waiting CLI stops at once, with the reason, rather than waiting out the link.
+    expect(await cli.finished(backend as never, login as never)).toEqual({ state: "failed", code: "access_denied" });
   });
 
   test("scopes the backend's settings no longer allow say how to recover, and logout forgets them", async () => {

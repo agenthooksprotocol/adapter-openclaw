@@ -3,7 +3,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createInterface } from "node:readline";
 import { AuthError } from "agenthooksprotocol/client";
-import { CALLBACK_PATH, type Logins, type Status } from "./logins.js";
+import type { Logins, Status } from "./logins.js";
 
 const escape = (text: string) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
@@ -26,17 +26,24 @@ export function callbackRoute(logins: () => Logins) {
       return true;
     }
     const current = logins();
-    const url = new URL(request.url ?? CALLBACK_PATH, current.redirectUri);
+    // The route matches exactly, so the address is the redirect's own: a `publicUrl`
+    // path prefix a proxy stripped is kept. Only the query is the browser's.
+    const url = new URL(current.redirectUri);
+    url.search = new URL(request.url ?? "", "http://x").search;
     try {
       const backend = await current.complete(url.href);
       page(response, 200, "Signed in", `OpenClaw can now deliver to ${backend}. You can close this tab.`);
     } catch (error) {
       const code = error instanceof AuthError ? error.code : "provider_failed";
-      const reason = code === "interaction_required" ? "This sign-in link has expired or was already used." : code === "access_denied" ? "Sign-in was refused." : `Sign-in did not complete (${code}).`;
-      page(response, 400, "Not signed in", `${reason} Run \`openclaw ahp login\` for a new link.`);
+      page(response, 400, "Not signed in", `${failureReason(code)} Run \`openclaw ahp login\` for a new link.`);
     }
     return true;
   };
+}
+
+/** Why a sign-in did not complete, by the SDK's code. */
+function failureReason(code: string): string {
+  return code === "interaction_required" ? "This sign-in link has expired or was already used." : code === "access_denied" ? "Sign-in was refused." : `Sign-in did not complete (${code}).`;
 }
 
 function logoutText(result: { signedOut: boolean; forgotScopes: boolean }): string {
@@ -44,31 +51,27 @@ function logoutText(result: { signedOut: boolean; forgotScopes: boolean }): stri
   return result.forgotScopes ? "was not signed in; forgot the scopes it asked for" : "was not signed in";
 }
 
-export function describeStatus(status: Status, withLink: boolean): string {
+export function describeStatus(status: Status): string {
   switch (status.state) {
     case "authorized": return "authorized";
     case "client-credentials": return "client-credentials";
     case "bearer": return "bearer token";
     case "not-configured": return "no OAuth";
     case "failing": return `failing: ${status.reason}`;
-    case "needs-login": {
-      const label = status.scopes?.length ? `needs-login for ${status.scopes.join(" ")}` : "needs-login";
-      if (!status.url) return label;
-      return withLink ? `${label}: ${status.url} (valid until ${new Date(status.expiresAt!).toISOString()})` : `${label} (run \`openclaw ahp login\` on the Gateway's host)`;
-    }
+    case "needs-login": return status.scopes?.length ? `needs-login for ${status.scopes.join(" ")}` : "needs-login";
   }
 }
 
-async function statusLines(logins: Logins, backends: { id: string }[], withLink: boolean): Promise<string> {
+async function statusLines(logins: Logins, backends: { id: string }[]): Promise<string> {
   if (!backends.length) return "No backends in hooks.json.";
-  const lines = await Promise.all(backends.map(async (backend) => `${backend.id}: ${describeStatus(await logins.status(backend as never), withLink)}`));
+  const lines = await Promise.all(backends.map(async (backend) => `${backend.id}: ${describeStatus(await logins.status(backend as never))}`));
   return lines.join("\n");
 }
 
 type CommandContext = { args?: string; senderIsOwner?: boolean; gatewayClientScopes?: string[] };
 
 /** `/ahp status|login [backend]|logout <backend>`, for the owner. Its reply lands in
- * the transcript, so it never carries a link: links go to the Gateway log. */
+ * the transcript, so it never carries a link: only `openclaw ahp login` shows one. */
 export function chatCommand(logins: () => Logins, backends: () => { id: string }[]) {
   return async (ctx: CommandContext): Promise<{ text: string }> => {
     const owner = ctx.senderIsOwner === true || (ctx.gatewayClientScopes ?? []).some((scope) => scope === "operator.admin" || scope === "operator.write");
@@ -76,7 +79,7 @@ export function chatCommand(logins: () => Logins, backends: () => { id: string }
     const [verb = "status", id] = (ctx.args ?? "").trim().split(/\s+/).filter(Boolean);
     const current = logins();
     try {
-      if (verb === "status") return { text: await statusLines(current, backends(), false) };
+      if (verb === "status") return { text: await statusLines(current, backends()) };
       if (verb === "login") {
         const targets = id ? [{ id }] : await current.waiting();
         if (!targets.length) return { text: "No backend needs a sign-in." };
@@ -84,7 +87,7 @@ export function chatCommand(logins: () => Logins, backends: () => { id: string }
           const backend = current.backend(target.id);
           if (!backend) return `${target.id}: not a backend in hooks.json`;
           const status = await current.status(backend);
-          return status.state === "needs-login" ? `${target.id}: run \`openclaw ahp login ${target.id}\` on the Gateway's host for the sign-in link` : `${target.id}: ${describeStatus(status, false)}`;
+          return status.state === "needs-login" ? `${target.id}: run \`openclaw ahp login ${target.id}\` on the Gateway's host for the sign-in link` : `${target.id}: ${describeStatus(status)}`;
         }));
         return { text: lines.join("\n") };
       }
@@ -110,7 +113,7 @@ export function cliCommands(program: Command, logins: () => Logins, backends: ()
     const current = logins();
     const stopped = await gatewayStopped(current);
     if (stopped) console.log(stopped);
-    console.log(await statusLines(current, backends(), true));
+    console.log(await statusLines(current, backends()));
   });
   ahp.command("login").argument("[backend]", "a backend id; without one, every backend that needs it")
     .description("Sign in to a backend, in a browser").action(async (id?: string) => {
@@ -132,9 +135,10 @@ export function cliCommands(program: Command, logins: () => Logins, backends: ()
           continue;
         }
         console.log(`Sign in to ${target.id}: ${result.url}`);
-        if (!(await waitForLogin(current, target.id, result))) {
+        const outcome = await waitForLogin(current, target.id, result);
+        if (outcome.state !== "completed") {
           failed = true;
-          console.log(`${target.id}: the link expired before sign-in finished`);
+          console.log(outcome.state === "failed" ? `${target.id}: not signed in: ${failureReason(outcome.code)}` : `${target.id}: the link expired before sign-in finished`);
           continue;
         }
         console.log(`${target.id}: signed in`);
@@ -178,7 +182,7 @@ export async function gatewayStopped(logins: Pick<Logins, "redirectUri" | "loopb
 }
 
 /** Until the Gateway (or a pasted address, on a terminal) completes the login. */
-async function waitForLogin(logins: Logins, id: string, login: { expiresAt: number; state: string; requiredScopes: readonly string[] }): Promise<boolean> {
+async function waitForLogin(logins: Logins, id: string, login: { expiresAt: number; state: string }): Promise<Awaited<ReturnType<Logins["finished"]>>> {
   const backend = logins.backend(id)!;
   let pasted: Promise<void> | undefined;
   const lines = process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stdout }) : undefined;
@@ -194,10 +198,11 @@ async function waitForLogin(logins: Logins, id: string, login: { expiresAt: numb
   try {
     while (Date.now() < login.expiresAt) {
       await pasted;
-      if (await logins.finished(backend, login)) return true;
+      const outcome = await logins.finished(backend, login);
+      if (outcome.state !== "pending") return outcome;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    return false;
+    return { state: "pending" };
   } finally {
     lines?.close();
   }
