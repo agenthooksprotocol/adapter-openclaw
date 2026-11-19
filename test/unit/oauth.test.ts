@@ -4,8 +4,8 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthError } from "agenthooksprotocol/client";
-import { bindingKey, frame, type StoredRecord } from "agenthooksprotocol/oauth";
-import { Logins, type LoginHost } from "../../src/oauth/logins";
+import { frame, type StoredRecord } from "agenthooksprotocol/oauth";
+import { configuredPort, Logins, type LoginHost } from "../../src/oauth/logins";
 import { privateAddress } from "../../src/oauth/network";
 import { fileSecretStore, resolveSecret } from "../../src/oauth/secrets";
 import { backendSettings, trustedIssuer } from "../../src/oauth/settings";
@@ -263,8 +263,7 @@ function logins(backends: Record<string, unknown>[], settings = {}, extra: Parti
     secrets: fileSecretStore(join(dir, "s")),
     settings: { secrets: { "the-secret": "shh" }, ...settings },
     environment: {},
-    livePort: () => undefined,
-    configuredPort: () => 18789,
+    port: () => 18789,
     backends: () => backends as never,
     log: () => {},
     warn: () => {},
@@ -282,16 +281,12 @@ describe("client selection", () => {
     expect(() => logins([http("a")]).selectClient(issuers, "https://hooks.example/ahp", context("a"))).toThrow(AuthError);
   });
 
-  test("pre-registered, partitioned by backend, redirected to the Gateway", () => {
+  test("pre-registered, partitioned by backend; each login names its own redirect", () => {
     const client = logins([http("a", { issuer: "https://as.example", clientId: "oc", scopes: ["hooks"] })]).selectClient(issuers, "https://hooks.example/ahp", context("a"));
-    expect(client).toMatchObject({ issuer: "https://as.example", clientId: "oc", flow: "authorization_code_pkce", scopes: ["hooks"], grantPartition: "a", redirectUri: "http://127.0.0.1:18789/ahp/oauth/callback" });
+    expect(client).toMatchObject({ issuer: "https://as.example", clientId: "oc", flow: "authorization_code_pkce", scopes: ["hooks"], grantPartition: "a" });
+    expect(client.redirectUri).toBeUndefined();
     const other = logins([http("b", { issuer: "https://as.example", clientId: "oc" })]).selectClient(issuers, "https://hooks.example/ahp", context("b"));
     expect(other.grantPartition).toBe("b");
-  });
-
-  test("a public URL replaces the loopback redirect", () => {
-    const client = logins([http("a", { issuer: "https://as.example" })], { publicUrl: "https://gw.example.ts.net/" }).selectClient(issuers, "r", context("a"));
-    expect(client.redirectUri).toBe("https://gw.example.ts.net/ahp/oauth/callback");
   });
 
   test("a metadata document or a registration permission, for the configured issuer", () => {
@@ -375,43 +370,31 @@ describe("redirect", () => {
     expect(at("https://gw.example/openclaw/")).toBe("https://gw.example/openclaw/ahp/oauth/callback");
     expect(at("http://127.0.0.1:9000")).toBe("http://127.0.0.1:9000/ahp/oauth/callback");
     expect(at("http://gw.example")).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
+    expect(at("http://localhost:9000")).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
     expect(at("https://user:pw@gw.example")).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
     expect(at("https://gw.example/?x=1")).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
-    expect(warnings).toHaveLength(3);
+    expect(warnings).toHaveLength(4);
   });
 
-  test("openclaw ahp uses the redirect the running Gateway recorded, whatever its --port", async () => {
-    const saved = new Map<string, string>();
-    const redirects = { lookup: async (key: string) => saved.get(key), register: async (key: string, value: string) => { saved.set(key, value); } };
-    const gateway = logins([http], {}, { livePort: () => 4242, redirects });
-    await gateway.recordRedirect();
-    const cli = logins([http], {}, { redirects });
-    expect(cli.redirectUri).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
-    await cli.loadRedirect();
-    expect(cli.redirectUri).toBe("http://127.0.0.1:4242/ahp/oauth/callback");
-    expect(cli.selectClient(["https://as.example"], "r", { backendId: "a", purpose: "event", url: "https://hooks.example/ahp" }).redirectUri).toBe(gateway.redirectUri);
+  test("is the Gateway's route, on the port OpenClaw's CLI reaches it on, unless publicUrl says otherwise", () => {
+    expect(logins([http]).redirectUri).toBe("http://127.0.0.1:18789/ahp/oauth/callback");
+    expect(logins([http], { publicUrl: "https://gw.example.ts.net/" }).redirectUri).toBe("https://gw.example.ts.net/ahp/oauth/callback");
+    expect(configuredPort({ gateway: { port: 4242 } }, {})).toBe(4242);
+    expect(configuredPort({ gateway: { port: 4242 } }, { OPENCLAW_GATEWAY_PORT: "5151" })).toBe(5151);
+    expect(configuredPort(undefined, {})).toBe(18789);
   });
 });
 
 describe("logins", () => {
   const backend = (id: string) => ({ id, transport: { type: "http", url: `https://hooks.example/${id}` }, oauth: { issuer: "https://as.example" } });
 
-  test("a callback completes the backend whose pending login it answers, of two", async () => {
+  test("a callback completes only a stored login, of a backend still in hooks.json", async () => {
     const store = keyedTokenStore(new Table<StoredRecord>(), new Table<string>());
-    const finished: string[] = [];
-    class Recording extends Logins {
-      protected override async finish(backendId: string) { finished.push(backendId); }
-    }
-    const instance = new Recording({ store, secrets: fileSecretStore(join(dir, "s2")), settings: {}, environment: {}, livePort: () => undefined, configuredPort: () => 18789, backends: () => [backend("a"), backend("b")] as never, log: () => {}, warn: () => {} });
-    for (const id of ["a", "b"]) {
-      const context = instance.context(backend(id) as never)!;
-      const key = frame("ahp.oauth.pending:", [bindingKey("openclaw", context)]);
-      await store.compareAndSet(key, undefined, { kind: "pending_login", generation: "g", id: `login-${id}`, grantKey: `grant-${id}`, expiresAt: Date.now() + 60_000, authorizationUrl: `https://as.example/authorize?state=state-${id}`, state: `state-${id}`, verifier: "v", client: {} as never, metadata: {} as never, context: { backendId: id, purpose: "event", url: context.url } }, signal());
-    }
-    expect(await instance.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=state-b")).toBe("b");
-    expect(finished).toEqual(["b"]);
-    await expect(instance.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=state-z")).rejects.toThrow(AuthError);
-    expect(finished).toEqual(["b"]);
+    const instance = logins([backend("a")], {}, { store });
+    await expect(instance.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=unknown")).rejects.toMatchObject({ code: "interaction_required" });
+    const context = { backendId: "gone", purpose: "event" as const, url: "https://hooks.example/gone" };
+    await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s-gone"]), undefined, { kind: "pending_login", generation: "g", state: "s-gone", grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: "https://as.example/authorize?state=s-gone", verifier: "v", client: {} as never, metadata: {} as never, context, source: "dcr" }, signal());
+    await expect(instance.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s-gone")).rejects.toMatchObject({ code: "interaction_required" });
   });
 
   test("a backend skipped at initialization is prepared once after a sign-in elsewhere, so Hooks tries it again; otherwise a signed-in backend is not prepared", async () => {
@@ -421,7 +404,7 @@ describe("logins", () => {
       override async status() { return { state: "authorized" as const }; }
       override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
-    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, livePort: () => undefined, configuredPort: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
+    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
     instance.initializationFailed.add("a");
     await instance.hint();
     expect(prepared).toEqual(["a"]);
@@ -430,25 +413,23 @@ describe("logins", () => {
     expect(logged).toEqual([]);
   });
 
-  test("a sign-in that cannot be prepared is warned of once per backend and reason, without its link", async () => {
+  test("the Gateway log says a sign-in is needed once until it is signed in, never with a link, and prepares none", async () => {
     const warnings: string[] = [];
-    class Failing extends Logins {
-      override async status() { return { state: "needs-login" as const }; }
-      override async login(): Promise<never> { throw new AuthError("discovery_failed"); }
+    const prepared: string[] = [];
+    let state: "needs-login" | "authorized" = "needs-login";
+    class Waiting extends Logins {
+      override async status() { return { state }; }
+      override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
-    const instance = new Failing({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, livePort: () => undefined, configuredPort: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
+    const instance = new Waiting({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
     await instance.hint();
     await instance.hint();
-    expect(warnings).toEqual(["Agent Hooks Protocol: a: a sign-in could not be prepared (discovery_failed)"]);
-  });
-
-  test("the Gateway log says a sign-in is needed, once per link, and never shows the link", () => {
-    const warnings: string[] = [];
-    const instance = logins([backend("a")], {}, { warn: (text) => warnings.push(text) });
-    instance.show("a", "https://as.example/authorize?state=secret");
-    instance.show("a", "https://as.example/authorize?state=secret");
-    instance.show("a", "https://as.example/authorize?state=next");
+    state = "authorized";
+    await instance.hint();
+    state = "needs-login";
+    await instance.hint();
     expect(warnings).toEqual(Array(2).fill("Agent Hooks Protocol: sign-in needed for a: run `openclaw ahp login a` on the Gateway's host"));
+    expect(prepared).toEqual([]);
   });
 });
 

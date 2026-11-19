@@ -12,7 +12,6 @@
 //     "clientSecretRef": "example-secret",    // a key in the plugin config's `secrets`
 //     "clientMetadataDocument": { "url": "https://…/client.json", "redirectUris": ["http://127.0.0.1:18789/ahp/oauth/callback"] },
 //     "registration": true,                   // or { "clientName", "scopes", "initialAccessTokenRef" }: DCR at `issuer`
-//     "redirectPort": 33418,                  // other harnesses' own listener; not OpenClaw's, whose callback is the Gateway's
 //     "loginLifetimeMinutes": 10,
 //     "allowPrivateNetwork": false
 //   }
@@ -91,8 +90,6 @@ export function backendSettings(backend: Record<string, unknown>): { settings: B
       ignore("registration", "needs oauth.issuer");
     }
   }
-  // `redirectPort` is for adapters with a listener of their own. OpenClaw's callback
-  // is the Gateway's route, on the Gateway's port.
   if (given.loginLifetimeMinutes !== undefined) {
     const minutes = given.loginLifetimeMinutes;
     if (typeof minutes === "number" && minutes > 0 && minutes <= 10) settings.loginLifetimeMs = Math.round(minutes * 60_000);

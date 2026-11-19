@@ -2,12 +2,15 @@
 // state: one consent covers that backend's endpoints (its grant partition is its
 // id), and is never shared with another backend.
 //
-// Deliveries never start a login. One starts only from host code: the hint at the
-// start of a turn, `/ahp login`, or `openclaw ahp login`. A link is shown only
-// where the operator alone reads it: the Gateway log and the `openclaw ahp`
-// terminal. Never a chat reply: OpenClaw keeps those in the transcript the model
-// reads, and on a shared channel others would see it too. Whoever opens a link
-// binds their account to this Gateway.
+// Deliveries never start a login. Only `openclaw ahp login` does, and only its
+// terminal shows the link: not the Gateway log, which any operator with read
+// access can tail, and never a chat reply, which OpenClaw keeps in the transcript
+// the model reads. Whoever opens a link binds their account to this Gateway.
+//
+// The browser returns to the Gateway's own route, not to the CLI that started the
+// login. So pending logins are kept in the shared store (the SDK's
+// `persistPendingLogins`): the Gateway completes a login `openclaw ahp login`
+// prepared, by its state, and its own Hooks then tries a backend it skipped again.
 import { auth, AuthError, type DeliveryAuthContext, type DeliveryAuthProvider } from "agenthooksprotocol/client";
 import { bindingKey, frame, managedOAuth, type ClientConfig, type PendingLogin, type SecretStore, type StoredRecord, type TokenStore } from "agenthooksprotocol/oauth";
 import { checkDestination, policyFetch } from "./network.js";
@@ -44,18 +47,14 @@ export interface LoginHost {
   secrets: SecretStore;
   settings: PluginSettings;
   environment: Record<string, string | undefined>;
-  /** The port the Gateway listens on: known inside it once it has started. */
-  livePort: () => number | undefined;
-  /** The port config names, for a process that is not the Gateway. */
-  configuredPort: () => number;
-  /** Where the Gateway records its live redirect, for `openclaw ahp` to use the same. */
-  redirects?: { lookup(key: string): Promise<string | undefined>; register(key: string, value: string): Promise<void> };
+  /** The Gateway's port, as OpenClaw's own CLI resolves it: a sign-in returns there. */
+  port: () => number;
   backends: () => Backend[];
   log: (text: string) => void;
   warn: (text: string) => void;
 }
 
-/** The Gateway's port as OpenClaw resolves it, for a process that is not the Gateway. */
+/** The Gateway's port as OpenClaw's CLI resolves it: OPENCLAW_GATEWAY_PORT, then `gateway.port`. */
 export function configuredPort(config: { gateway?: { port?: unknown } } | undefined, environment: Record<string, string | undefined>): number {
   const env = Number(environment.OPENCLAW_GATEWAY_PORT);
   if (Number.isInteger(env) && env > 0) return env;
@@ -63,20 +62,18 @@ export function configuredPort(config: { gateway?: { port?: unknown } } | undefi
   return typeof port === "number" && port > 0 ? port : DEFAULT_PORT;
 }
 
-/** `publicUrl`: HTTPS, or HTTP on a loopback literal; no credentials, query or
+/** `publicUrl`: HTTPS, or HTTP on a loopback IP literal (RFC 8252: not `localhost`); no credentials, query or
  * fragment. A path prefix is kept: `https://host/gw` redirects to
  * `https://host/gw/ahp/oauth/callback`, for a proxy that strips it. */
 export function publicBase(value: unknown): { base?: string; problem?: string } {
   if (value === undefined) return {};
   let url: URL;
   try { url = new URL(String(value)); } catch { return { problem: "publicUrl is not a URL; ignored" }; }
-  const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname);
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return { problem: "publicUrl is not https (or http on a loopback address); ignored" };
+  const loopback = ["127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return { problem: "publicUrl is not https (or http on 127.0.0.1 or [::1]); ignored" };
   if (url.username || url.password || url.search || url.hash) return { problem: "publicUrl has credentials, a query or a fragment; ignored" };
   return { base: `${url.origin}${url.pathname.replace(/\/+$/, "")}` };
 }
-
-const REDIRECT_KEY = "gateway-redirect";
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -96,15 +93,15 @@ export class Logins {
   readonly #backends = new Map<string, { settings: BackendSettings; oauth: ReturnType<typeof managedOAuth>; route: DeliveryAuthProvider }>();
   /** Backends a delivery or initialization said need a login, with the scopes it asked for. */
   readonly #needed = new Map<string, readonly string[] | undefined>();
-  /** The last link logged for a backend: repeated turns show the same one once. */
-  readonly #shown = new Map<string, string>();
+  /** Backends the Gateway log has said need a sign-in: once, until signed in. */
+  readonly #hinted = new Set<string>();
+  /** Logins this process prepared, by backend: reused while valid. Only this process shows their links. */
+  readonly #links = new Map<string, PendingLogin>();
   readonly #checking = new Set<string>();
-  /** Failures to prepare a sign-in already warned of, by backend and code. */
+  /** Failures to resume a backend signed in to elsewhere, already warned of, by backend and code. */
   readonly #warned = new Set<string>();
   readonly #publicBase: string | undefined;
-  /** The Gateway's recorded redirect, read by a process that is not the Gateway. */
-  #savedRedirect: string | undefined;
-  /** Backends initialization skipped for authentication: Hooks re-attempts their configuration after a login is prepared. */
+  /** Backends initialization skipped for want of a login: Hooks re-attempts one after a prepare or completion in this process. */
   readonly initializationFailed = new Set<string>();
   /** Hooks' listeners for prepared endpoints, fed by every backend's managed OAuth. */
   readonly #prepared = new Set<(endpoint: { backendId: string; purpose: "event" | "upload"; url: string }) => void>();
@@ -134,6 +131,8 @@ export class Logins {
         return this.selectClient(issuers, resource, context);
       },
       loginLifetimeMs: settings.loginLifetimeMs,
+      // `openclaw ahp login` prepares; the Gateway's route (or a pasted address) completes.
+      persistPendingLogins: true,
     });
     entry = { settings, oauth, route: oauth.provider({ budget: (context) => budget(DELIVERY_MS, context.signal) }) };
     entry.route.onPrepared?.((endpoint) => {
@@ -154,24 +153,9 @@ export class Logins {
     },
   };
 
-  /** Stable per grant: a pending login is reused only for the same redirect. The
-   * Gateway's live port wins; `openclaw ahp` uses what the Gateway recorded, then config. */
+  /** Each login's redirect: the Gateway's route, at `publicUrl` or on its loopback port. */
   get redirectUri(): string {
-    if (this.#publicBase) return `${this.#publicBase}${CALLBACK_PATH}`;
-    const live = this.#host.livePort();
-    if (live) return `http://127.0.0.1:${live}${CALLBACK_PATH}`;
-    return this.#savedRedirect ?? `http://127.0.0.1:${this.#host.configuredPort()}${CALLBACK_PATH}`;
-  }
-
-  /** In the Gateway, once it listens: record the redirect it answers. */
-  async recordRedirect(): Promise<void> {
-    if (this.#host.livePort()) await this.#host.redirects?.register(REDIRECT_KEY, this.redirectUri);
-  }
-
-  /** Outside the Gateway: use the redirect it recorded. */
-  async loadRedirect(): Promise<void> {
-    const saved = await this.#host.redirects?.lookup(REDIRECT_KEY);
-    if (typeof saved === "string" && saved.endsWith(CALLBACK_PATH)) this.#savedRedirect = saved;
+    return `${this.#publicBase ?? `http://127.0.0.1:${this.#host.port()}`}${CALLBACK_PATH}`;
   }
 
   resolveReference(reference: string): string | undefined {
@@ -214,7 +198,6 @@ export class Logins {
       grantPartition: context.backendId,
       ...(clientId ? { clientId } : {}),
       ...(secret ? { clientSecret: secret } : {}),
-      ...(flow === "authorization_code_pkce" ? { redirectUri: this.redirectUri } : {}),
       ...(settings.clientMetadataDocument ? { clientMetadataDocument: settings.clientMetadataDocument } : {}),
       ...(registration ? {
         registration: {
@@ -274,12 +257,12 @@ export class Logins {
     this.#needed.set(backendId, requiredScopes);
   }
 
-  /** The stored pending login for a backend, while it is valid. */
-  async pending(context: DeliveryAuthContext): Promise<(PendingLogin & { state: string }) | undefined> {
-    const key = frame("ahp.oauth.pending:", [bindingKey(NAMESPACE, context)]);
-    const record = await this.#host.store.load(key, AbortSignal.timeout(DELIVERY_MS));
-    if (record?.kind !== "pending_login" || record.expiresAt <= Date.now()) return undefined;
-    return { type: "pending_login", authorizationUrl: record.authorizationUrl, expiresAt: record.expiresAt, key, id: record.id, state: record.state };
+  /** The login this process prepared for a backend, while it is valid. */
+  #link(backendId: string): PendingLogin | undefined {
+    const link = this.#links.get(backendId);
+    if (link && link.expiresAt > Date.now()) return link;
+    this.#links.delete(backendId);
+    return undefined;
   }
 
   /** The stored credential, renewed if it can be without a person. Never starts a login. */
@@ -297,22 +280,26 @@ export class Logins {
       if (!(error instanceof AuthError) || error.recovery !== "login") return { state: "failing", reason: describe(error) };
     }
     if (kind === "none") return { state: "failing", reason: "it asks for OAuth: give it an `oauth` object in hooks.json" };
-    const pending = await this.pending(context).catch(() => undefined);
-    return { state: "needs-login", ...(pending ? { url: pending.authorizationUrl, expiresAt: pending.expiresAt } : {}) };
+    const link = this.#link(backend.id);
+    return { state: "needs-login", ...(link ? { url: link.authorizationUrl, expiresAt: link.expiresAt } : {}) };
   }
 
-  /** Start, or reuse, a backend's login. Ready when its grant is usable. */
+  /** Start a backend's login, or reuse the one this process started. Ready when its grant is usable. */
   async login(backendId: string): Promise<{ type: "ready" } | { type: "pending"; url: string; expiresAt: number }> {
     const backend = this.backend(backendId);
     const context = backend && this.context(backend);
     if (!context) throw new Error(`${backendId} is not an HTTP backend in hooks.json`);
-    const requiredScopes = this.#needed.get(backendId);
-    const result = await this.#for(backendId).oauth.prepare(context, budget(PREPARE_MS), requiredScopes ? { requiredScopes } : {});
-    if (result.type === "ready") {
-      this.#ready(backendId);
-      return { type: "ready" };
+    let link = this.#link(backendId);
+    if (!link) {
+      const requiredScopes = this.#needed.get(backendId);
+      const result = await this.#for(backendId).oauth.prepare(context, budget(PREPARE_MS), { redirectUri: this.redirectUri, ...(requiredScopes ? { requiredScopes } : {}) });
+      if (result.type === "ready") {
+        this.#ready(backendId);
+        return { type: "ready" };
+      }
+      this.#links.set(backendId, (link = result));
     }
-    return { type: "pending", url: result.authorizationUrl, expiresAt: result.expiresAt };
+    return { type: "pending", url: link.authorizationUrl, expiresAt: link.expiresAt };
   }
 
   /** The backends to sign in to: every HTTP backend that needs it, never one with a usable grant. */
@@ -326,8 +313,9 @@ export class Logins {
     return backends;
   }
 
-  /** At the start of a turn: prepare, in the background, the logins backends need, and
-   * log each link once. Never awaited by the turn. */
+  /** At the start of a turn, in the background: say once in the Gateway log which
+   * backends need a sign-in. Never awaited by the turn, and never prepares a login:
+   * its link could be shown nowhere private. */
   hint(): Promise<void> {
     const work: Promise<void>[] = [];
     for (const backend of this.#host.backends()) {
@@ -337,87 +325,75 @@ export class Logins {
       this.#checking.add(backend.id);
       work.push((async () => {
         const status = await this.status(backend);
-        if (status.state !== "needs-login") {
-          // Signed in in another process (`openclaw ahp`): its prepare notified only that
-          // process's Hooks. One prepare here, which finds the grant and makes no request,
-          // lets this Gateway's Hooks try the skipped backend again.
-          if (status.state === "authorized" && this.initializationFailed.delete(backend.id)) await this.login(backend.id);
-          return this.#ready(backend.id);
+        if (status.state === "needs-login") return this.show(backend.id);
+        // Signed in from a pasted address in another process, which told only its own
+        // Hooks. One prepare here finds the grant without a request, and lets this
+        // Gateway's Hooks try the skipped backend again.
+        if (status.state === "authorized" && this.initializationFailed.has(backend.id)) {
+          await this.login(backend.id);
+          this.initializationFailed.delete(backend.id);
         }
-        this.#host.log(`${backend.id}: preparing a sign-in`);
-        const result = await this.login(backend.id);
-        if (result.type === "pending") this.show(backend.id, result.url);
+        this.#ready(backend.id);
       })().catch((error) => {
         const key = `${backend.id}\0${describe(error)}`;
         if (this.#warned.has(key)) return;
         this.#warned.add(key);
-        this.#host.warn(`Agent Hooks Protocol: ${backend.id}: a sign-in could not be prepared (${describe(error)})`);
+        this.#host.warn(`Agent Hooks Protocol: ${backend.id}: signed in, but could not be resumed (${describe(error)})`);
       }).finally(() => this.#checking.delete(backend.id)));
     }
     return Promise.all(work).then(() => {});
   }
 
-  /** Inside the Gateway: that a sign-in is needed, once per link. The link itself is
-   * shown only on the Gateway host's terminal, by `openclaw ahp`: the Gateway's log is
-   * readable to any operator with read access. */
-  show(backendId: string, url: string): void {
-    if (this.#shown.get(backendId) === url) return;
-    this.#shown.set(backendId, url);
+  /** In the Gateway log: that a backend needs a sign-in, once until it is signed in. */
+  show(backendId: string): void {
+    if (this.#hinted.has(backendId)) return;
+    this.#hinted.add(backendId);
     this.#host.warn(`Agent Hooks Protocol: sign-in needed for ${backendId}: run \`openclaw ahp login ${backendId}\` on the Gateway's host`);
   }
 
   #ready(backendId: string): void {
     this.#needed.delete(backendId);
-    this.#shown.delete(backendId);
+    this.#hinted.delete(backendId);
+    this.#links.delete(backendId);
   }
 
-  /** The browser came back: whichever backend's stored login it answers. Any process
-   * sharing the store may complete a login another process started. */
+  /** The browser came back, to the Gateway or pasted: complete the stored login its
+   * state names, whichever process prepared it, with its own backend's settings. */
   async complete(callback: string): Promise<string> {
     const state = new URL(callback).searchParams.get("state");
-    if (state) {
-      for (const backend of this.#host.backends()) {
-        const context = this.context(backend);
-        const pending = context && await this.pending(context);
-        if (!pending || pending.state !== state) continue;
-        const { state: _state, ...handle } = pending;
-        await this.finish(backend.id, handle, callback);
-        this.#ready(backend.id);
-        this.initializationFailed.delete(backend.id);
-        return backend.id;
-      }
-    }
-    throw new AuthError("interaction_required");
+    const record = state ? await this.#host.store.load(frame("ahp.oauth.pending:", [NAMESPACE, state]), AbortSignal.timeout(DELIVERY_MS)) : undefined;
+    const backendId = record?.kind === "pending_login" ? record.context.backendId : undefined;
+    if (!backendId || !this.backend(backendId)) throw new AuthError("interaction_required");
+    await this.#for(backendId).oauth.complete(callback, budget(DELIVERY_MS));
+    this.#ready(backendId);
+    this.initializationFailed.delete(backendId);
+    return backendId;
   }
 
-  /** Exchange the callback for the login it answers. */
-  protected async finish(backendId: string, handle: PendingLogin, callback: string): Promise<void> {
-    await this.#for(backendId).oauth.complete(handle, callback, budget(DELIVERY_MS));
-  }
-
-  /** Cancel a backend's pending login and delete its grant. Its binding stays, so its
-   * next delivery knows it needs a login again. */
+  /** Cancel a backend's pending logins, whichever process prepared them, and delete
+   * its grant. Its binding stays, so its next delivery knows it needs a login again. */
   async logout(backendId: string): Promise<boolean> {
     const backend = this.backend(backendId);
     const context = backend && this.context(backend);
     if (!context) throw new Error(`${backendId} is not an HTTP backend in hooks.json`);
     const operation = budget(DELIVERY_MS);
-    const pending = await this.pending(context);
-    if (pending) {
-      const { state: _state, ...handle } = pending;
-      await this.#for(backendId).oauth.cancel(handle, operation);
-    }
     const store = this.#host.store;
     const binding = await store.load(bindingKey(NAMESPACE, context), operation.signal);
-    let removed = Boolean(pending);
+    let removed = false;
     const grantKey = binding?.kind === "binding" ? binding.grantKey : undefined;
     if (grantKey) {
+      const index = await store.load(frame("ahp.oauth.pending-index:", [grantKey]), operation.signal);
+      for (const state of index?.kind === "pending_index" ? index.states : []) {
+        await this.#for(backendId).oauth.cancel({ type: "pending_login", state, authorizationUrl: "", expiresAt: 0 }, operation);
+        removed = true;
+      }
       removed = await store.coordinate(grantKey, operation.signal, async () => {
         const grant: StoredRecord | undefined = await store.load(grantKey, operation.signal);
         return grant ? store.compareAndSet(grantKey, grant.generation, undefined, operation.signal) : false;
       }) || removed;
     }
-    this.#shown.delete(backendId);
+    this.#hinted.delete(backendId);
+    this.#links.delete(backendId);
     return removed;
   }
 }

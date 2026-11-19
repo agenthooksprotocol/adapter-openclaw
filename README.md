@@ -80,29 +80,32 @@ grant is never asked to sign in again.
 
 **How a sign-in happens.** A delivery never starts one. When a backend refuses a
 delivery for want of a token, or its `oauth` settings have no usable grant yet, the
-next turn prepares a sign-in in the background (the turn does not wait) and says so
-in the Gateway log, once per link:
+next turn says so in the Gateway log, once until it is signed in:
 
 ```
 Agent Hooks Protocol: sign-in needed for com.example.policy: run `openclaw ahp login com.example.policy` on the Gateway's host
 ```
 
-The link itself is shown only by `openclaw ahp status` and `openclaw ahp login`, on
-the Gateway host's terminal. Not in the Gateway log, which any operator with read
+`openclaw ahp login`, on the Gateway host's terminal, starts the sign-in and is the
+only place its link is shown. Not in the Gateway log, which any operator with read
 access can tail; not in a chat reply, because OpenClaw keeps those in the transcript
 the model reads, and on a shared channel others would see it too. Whoever opens a
-link binds their account to this Gateway. Repeated turns reuse the same link until
-it expires (10 minutes at most); the turn after that prepares a new one.
+link binds their account to this Gateway. A link lasts 10 minutes at most. Each
+`openclaw ahp login` has its own, so two can run at once; whichever finishes last
+is the grant every process then uses.
 
 The browser returns to the Gateway's own route, `/ahp/oauth/callback`, which
 completes the sign-in and says "You can close this tab". It needs no Gateway
-token: the OAuth state authenticates the callback.
+token: the OAuth state authenticates the callback. The Gateway can complete a login
+that `openclaw ahp login` started because pending sign-ins are kept in plugin state,
+which both share; the Gateway then starts delivering to that backend at its next
+turn.
 
 **Commands.** On the Gateway's host:
 
 ```sh
-openclaw ahp status            # each backend: authorized, needs-login (with its link), client-credentials, bearer token, or failing: why
-openclaw ahp login [backend]   # print the link and wait; without a backend, every backend that needs it
+openclaw ahp status            # each backend: authorized, needs-login, client-credentials, bearer token, or failing: why
+openclaw ahp login [backend]   # start a sign-in, print its link and wait; without a backend, every backend that needs it
 openclaw ahp complete <url>    # finish with the address the browser ended on, if it could not reach the Gateway
 openclaw ahp logout <backend>  # cancel its pending sign-in and delete its tokens
 ```
@@ -111,12 +114,10 @@ openclaw ahp logout <backend>  # cancel its pending sign-in and delete its token
 link returns to it. `openclaw ahp login` on a terminal also accepts that address
 pasted in. In chat, the
 owner's `/ahp status`, `/ahp login [backend]` and `/ahp logout <backend>` do the same,
-without ever putting a link in the reply: `/ahp login` prepares the sign-in and points
-at `openclaw ahp login`.
+without ever putting a link in the reply: `/ahp login` points at `openclaw ahp login`.
 
 Without a person (CI, `openclaw agent --local` in a script), the hint is only
-logged, and a failure to prepare one is warned of once per backend and reason: use
-client credentials. `openclaw agent exec` runs with a temporary state
+logged: use client credentials. `openclaw agent exec` runs with a temporary state
 directory, so it has no sign-in of the Gateway's: use client credentials, or
 `--state-dir` to share the Gateway's.
 
@@ -142,9 +143,8 @@ them all:
 | `scopes` | Scopes to request. |
 | `clientId` | A client registered in advance. It always wins. |
 | `clientSecretRef` | A key in the plugin config's `secrets`. |
-| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document you publish, used where the issuer supports them. `redirectUris` must include the Gateway's callback. The adapter publishes none of its own: a document lists exact redirects, and each Gateway's differs. |
-| `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. |
-| `redirectPort` | Not used by OpenClaw: the callback is the Gateway's route, on the Gateway's port. |
+| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document you publish, used where the issuer supports them. `redirectUris` must include the Gateway's callback (a loopback one may leave out the port). The adapter publishes none of its own. |
+| `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. Each sign-in registers its own, for the Gateway's callback. |
 | `loginLifetimeMinutes` | How long a sign-in link lasts, up to 10 (the default). |
 | `allowPrivateNetwork` | Allow the authorization server on loopback or private addresses. Default `false`. |
 
@@ -158,12 +158,8 @@ What is OpenClaw's alone goes in the plugin config,
 
 | Setting | Meaning |
 | --- | --- |
-| `publicUrl` | The Gateway as a browser reaches it, behind a proxy or Tailscale: HTTPS, or HTTP on a loopback address, with no credentials, query or fragment (otherwise it is ignored with a warning). A path prefix is kept, for a proxy that strips it: the redirect is `<publicUrl>/ahp/oauth/callback`. By default it is `http://127.0.0.1:<gateway port>/ahp/oauth/callback`. |
+| `publicUrl` | The Gateway as a browser reaches it, behind a proxy or Tailscale: HTTPS, or HTTP on `127.0.0.1` or `[::1]` (not `localhost`), with no credentials, query or fragment (otherwise it is ignored with a warning). A path prefix is kept, for a proxy that strips it: the redirect is `<publicUrl>/ahp/oauth/callback`. By default it is `http://127.0.0.1:<port>/ahp/oauth/callback`, where the port is the one OpenClaw's CLI reaches the Gateway on: `OPENCLAW_GATEWAY_PORT`, else `gateway.port`. |
 | `secrets` | `{ "<ref>": <secret> }` for `tokenRef`, `clientSecretRef` and `initialAccessTokenRef`. A secret is a string, or a SecretRef `{ "source": "env", "provider": "default", "id": "NAME" }` or `{ "source": "file", "provider": "…", "id": "/path" }`. |
-
-The redirect stays the same for each grant. The Gateway records the one it answers
-on (its live port, whatever `--port` it was started with) in plugin state, and
-`openclaw ahp` uses that one; before a Gateway has run, it uses `gateway.port`.
 
 ### Where credentials live
 
@@ -173,7 +169,7 @@ on (its live port, whatever `--port` it was started with) in plugin state, and
   A short-lived lease row (`ahp-oauth-leases`), renewed atomically while held, keeps
   the two from refreshing or completing the same grant at once; a holder that loses
   its lease says so in the log, and its writes still go through only where the record's
-generation is unchanged. The Gateway's redirect is in `ahp-oauth-gateway`.
+  generation is unchanged.
 - Client secrets that a registration issued: OpenClaw has no secret store a plugin
   can write, so each is a file of its own, mode `0600`, in
   `<state dir>/plugins/agent-hooks-protocol/oauth-secrets/` (mode `0700`), apart from

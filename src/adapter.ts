@@ -117,8 +117,6 @@ export class Adapter {
   #logins: Logins | undefined;
   /** Sign-in could not start here: said once. */
   #loginsUnavailable = false;
-  /** The Gateway's port, once it has started. */
-  port: number | undefined;
   /** Deliveries under way, in every session. */
   readonly #inFlight = new Set<Promise<unknown>>();
   /** Where a tool that reports no session goes. */
@@ -167,7 +165,6 @@ export class Adapter {
       const settings = (this.api.pluginConfig ?? {}) as PluginSettings;
       const environment = process.env;
       const { state } = this.api.runtime;
-      const redirects = state.openKeyedStore<string>({ namespace: "ahp-oauth-gateway", retention: "retained" }) as unknown as KeyedStore<string>;
       const records = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth", retention: "retained" }) as unknown as KeyedStore<StoredRecord>;
       const leases = state.openKeyedStore<string>({ namespace: "ahp-oauth-leases", maxEntries: 10_000 }) as unknown as KeyedStore<string>;
       const directory = join(stateDir(environment) ?? state.resolveStateDir(), "plugins", PLUGIN_ID, "oauth-secrets");
@@ -176,9 +173,7 @@ export class Adapter {
         secrets: Logins.secrets(fileSecretStore(directory), settings, environment),
         settings,
         environment,
-        livePort: () => this.port,
-        configuredPort: () => configuredPort(this.api.config as never, environment),
-        redirects,
+        port: () => configuredPort(this.api.config as never, environment),
         backends: () => (this.registration().registration?.hooks ?? []) as never,
         log: (text) => this.log(text),
         warn: (text) => this.warn(text),
