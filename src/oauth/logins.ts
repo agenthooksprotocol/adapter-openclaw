@@ -20,13 +20,14 @@ import { bindingKey, frame, managedOAuth, type ClientConfig, type PendingLogin, 
 import { checkDestination, policyFetch } from "./network.js";
 import { resolveSecret } from "./secrets.js";
 import { backendSettings, trustedIssuer, type BackendSettings } from "./settings.js";
-import type { KeyedStore } from "./store.js";
+import type { ComparingStore } from "./store.js";
 
 export const CALLBACK_PATH = "/ahp/oauth/callback";
 export const NAMESPACE = "openclaw";
 const DEFAULT_PORT = 18789;
 const PREPARE_MS = 120_000;
 const DELIVERY_MS = 30_000;
+const CONFLICT_RETRIES = 5;
 
 /** `plugins.entries.agent-hooks-protocol.config`: what is OpenClaw's alone. A
  * backend's OAuth settings are its `oauth` object in hooks.json, as for every harness. */
@@ -50,8 +51,9 @@ export type Status =
 export interface LoginHost {
   store: TokenStore;
   /** Scopes a step-up asked for, by backend id, space-separated and sorted: shared
-   * with the CLI, which signs in for them. */
-  stepUps: KeyedStore<string>;
+   * with the CLI, which signs in for them. Changed only by compare-and-apply: the
+   * Gateway and the CLI both write it. */
+  stepUps: ComparingStore<string>;
   secrets: SecretStore;
   settings: PluginSettings;
   environment: Record<string, string | undefined>;
@@ -96,6 +98,9 @@ function budget(ms: number, signal?: AbortSignal) {
 const joinScopes = (scopes: readonly string[]) => [...new Set(scopes)].sort().join(" ");
 const splitScopes = (kept: string | undefined): readonly string[] => kept?.split(" ").filter(Boolean) ?? [];
 
+/** The SDK's key for one pending login, by its state. */
+const pendingKey = (state: string) => frame("ahp.oauth.pending:", [NAMESPACE, state]);
+
 const describe = (error: unknown) => error instanceof AuthError ? error.code : error instanceof Error ? error.message : String(error);
 
 export class Logins {
@@ -107,8 +112,9 @@ export class Logins {
   readonly #needed = new Map<string, readonly string[] | undefined>();
   /** Backends the Gateway log has said need a sign-in: once, until signed in. */
   readonly #hinted = new Set<string>();
-  /** Logins this process prepared, by backend: reused while valid. Only this process shows their links. */
-  readonly #links = new Map<string, PendingLogin>();
+  /** Logins this process prepared, by backend, with the scopes each required: reused
+   * while valid. Only this process shows their links. */
+  readonly #links = new Map<string, PendingLogin & { requiredScopes: readonly string[] }>();
   readonly #checking = new Set<string>();
   /** Failures to resume a backend signed in to elsewhere, already warned of, by backend and code. */
   readonly #warned = new Set<string>();
@@ -119,6 +125,7 @@ export class Logins {
   readonly #prepared = new Set<(endpoint: { backendId: string; purpose: "event" | "upload"; url: string }) => void>();
 
   constructor(host: LoginHost) {
+    if (typeof host.stepUps.observe !== "function" || typeof host.stepUps.compareAndApply !== "function") throw new Error("this OpenClaw has no compare-and-apply plugin state");
     this.#host = host;
     const { base, problem } = publicBase(host.settings.publicUrl);
     if (problem) host.warn(`Agent Hooks Protocol: ${problem}`);
@@ -177,7 +184,13 @@ export class Logins {
 
   /** Each login's redirect: the Gateway's route, at `publicUrl` or on its loopback port. */
   get redirectUri(): string {
-    return `${this.#publicBase ?? `http://127.0.0.1:${this.#host.port()}`}${CALLBACK_PATH}`;
+    return this.#publicBase ? `${this.#publicBase}${CALLBACK_PATH}` : this.loopbackUri;
+  }
+
+  /** The Gateway's route on its loopback port, which `openclaw ahp` on its host can
+   * reach even where the host cannot reach its own `publicUrl`. */
+  get loopbackUri(): string {
+    return `http://127.0.0.1:${this.#host.port()}${CALLBACK_PATH}`;
   }
 
   resolveReference(reference: string): string | undefined {
@@ -277,13 +290,11 @@ export class Logins {
   /** A delivery or initialization diagnostic with `recovery: "login"`. Scopes it asks
    * for are kept for `openclaw ahp login`, added to any not yet signed in for. */
   needsLogin(backendId: string, requiredScopes?: readonly string[]): Promise<void> {
-    this.#needed.set(backendId, requiredScopes);
+    const needed = this.#needed.get(backendId);
+    this.#needed.set(backendId, requiredScopes?.length ? splitScopes(joinScopes([...needed ?? [], ...requiredScopes])) : needed);
     if (!requiredScopes?.length) return Promise.resolve();
-    return (async () => {
-      const kept = await this.stepUp(backendId);
-      const scopes = joinScopes([...kept, ...requiredScopes]);
-      if (scopes !== joinScopes(kept)) await this.#host.stepUps.register(backendId, scopes);
-    })().catch((error) => this.#host.warn(`Agent Hooks Protocol: ${backendId}: could not keep the scopes it asks for (${describe(error)})`));
+    return this.#changeStepUp(backendId, (kept) => [...kept, ...requiredScopes])
+      .catch((error) => this.#host.warn(`Agent Hooks Protocol: ${backendId}: could not keep the scopes it asks for (${describe(error)})`));
   }
 
   /** The scopes a step-up asked for that no stored grant covers yet. */
@@ -291,22 +302,35 @@ export class Logins {
     return splitScopes(await this.#host.stepUps.lookup(backendId));
   }
 
-  /** A grant covering `granted` is stored: forget a step-up it answers. Compared with
-   * what was read, so a step-up recorded in between is kept. */
-  async #steppedUp(backendId: string, granted: readonly string[]): Promise<void> {
+  /** Change a backend's step-up scopes in one compare-and-apply, so a step-up the
+   * other process records in between is never lost; no scopes left deletes the row. */
+  async #changeStepUp(backendId: string, change: (kept: readonly string[]) => readonly string[]): Promise<void> {
     const stepUps = this.#host.stepUps;
+    for (let attempt = 0; attempt < CONFLICT_RETRIES; attempt += 1) {
+      const seen = await stepUps.observe(backendId);
+      const next = joinScopes(change(splitScopes(seen.value)));
+      if (next === (seen.value ?? "")) return;
+      const result = await stepUps.compareAndApply(backendId, seen.comparison, next
+        ? { operation: "update", action: "set", value: next }
+        : { operation: "delete", action: "delete" });
+      if (result.status !== "conflict") return;
+    }
+    throw new Error("step-up scopes kept changing");
+  }
+
+  /** A grant covering `granted` is stored: forget those scopes of a step-up. Any
+   * asked for since are kept. */
+  async #steppedUp(backendId: string, granted: readonly string[]): Promise<void> {
+    if (!granted.length) return;
     try {
-      const kept = await stepUps.lookup(backendId);
-      if (kept === undefined || !splitScopes(kept).every((scope) => granted.includes(scope))) return;
-      if (stepUps.deleteIfEqual) await stepUps.deleteIfEqual(backendId, kept);
-      else if ((await stepUps.lookup(backendId)) === kept) await stepUps.delete(backendId);
+      await this.#changeStepUp(backendId, (kept) => kept.filter((scope) => !granted.includes(scope)));
     } catch (error) {
       this.#host.warn(`Agent Hooks Protocol: ${backendId}: signed in, but could not clear the scopes it asked for (${describe(error)})`);
     }
   }
 
   /** The login this process prepared for a backend, while it is valid. */
-  #link(backendId: string): PendingLogin | undefined {
+  #link(backendId: string) {
     const link = this.#links.get(backendId);
     if (link && link.expiresAt > Date.now()) return link;
     this.#links.delete(backendId);
@@ -340,7 +364,7 @@ export class Logins {
   }
 
   /** Start a backend's login, or reuse the one this process started. Ready when its grant is usable. */
-  async login(backendId: string): Promise<{ type: "ready" } | { type: "pending"; url: string; expiresAt: number }> {
+  async login(backendId: string): Promise<{ type: "ready" } | { type: "pending"; url: string; expiresAt: number; state: string; requiredScopes: readonly string[] }> {
     const backend = this.backend(backendId);
     const context = backend && this.context(backend);
     if (!context) throw new Error(`${backendId} is not an HTTP backend in hooks.json`);
@@ -348,16 +372,38 @@ export class Logins {
     if (!link) {
       // A step-up the Gateway saw, in whichever process this is.
       const requiredScopes = [...new Set([...(this.#needed.get(backendId) ?? []), ...await this.stepUp(backendId)])];
-      const result = await this.managed(backendId).prepare(context, budget(PREPARE_MS), { redirectUri: this.redirectUri, ...(requiredScopes.length ? { requiredScopes } : {}) });
+      let result;
+      try {
+        result = await this.managed(backendId).prepare(context, budget(PREPARE_MS), { redirectUri: this.redirectUri, ...(requiredScopes.length ? { requiredScopes } : {}) });
+      } catch (error) {
+        // Scopes kept from a step-up that this backend's settings no longer allow: asking
+        // again would be refused every time.
+        if (error instanceof AuthError && error.code === "access_denied" && requiredScopes.length) {
+          throw new Error(`${backendId} asked for scopes its OAuth settings do not allow (${requiredScopes.join(" ")}): run \`openclaw ahp logout ${backendId}\` to forget them, or add them to its \`oauth.scopes\` in hooks.json`, { cause: error });
+        }
+        throw error;
+      }
       if (result.type === "ready") {
         // The stored grant covers every scope asked for.
         await this.#steppedUp(backendId, requiredScopes);
         this.#ready(backendId);
         return { type: "ready" };
       }
-      this.#links.set(backendId, (link = result));
+      this.#links.set(backendId, (link = { ...result, requiredScopes }));
     }
-    return { type: "pending", url: link.authorizationUrl, expiresAt: link.expiresAt };
+    return { type: "pending", url: link.authorizationUrl, expiresAt: link.expiresAt, state: link.state, requiredScopes: link.requiredScopes };
+  }
+
+  /** Whether the login `login` returned has completed, in whichever process: its
+   * pending record is gone and none of the scopes it asked for are still asked for.
+   * A step-up the Gateway recorded since does not make it look unfinished. */
+  async finished(backend: Backend, login: { state: string; requiredScopes: readonly string[] }): Promise<boolean> {
+    const status = await this.status(backend);
+    if (status.state === "authorized") return true;
+    // Only a backend with a stored credential lists scopes.
+    if (status.state !== "needs-login" || !status.scopes?.length) return false;
+    if (status.scopes.some((scope) => login.requiredScopes.includes(scope))) return false;
+    return (await this.#host.store.load(pendingKey(login.state), AbortSignal.timeout(DELIVERY_MS))) === undefined;
   }
 
   /** The backends to sign in to: every HTTP backend that needs it, never one with a usable grant. */
@@ -419,7 +465,7 @@ export class Logins {
    * state names, whichever process prepared it, with its own backend's settings. */
   async complete(callback: string): Promise<string> {
     const state = new URL(callback).searchParams.get("state");
-    const record = state ? await this.#host.store.load(frame("ahp.oauth.pending:", [NAMESPACE, state]), AbortSignal.timeout(DELIVERY_MS)) : undefined;
+    const record = state ? await this.#host.store.load(pendingKey(state), AbortSignal.timeout(DELIVERY_MS)) : undefined;
     const backendId = record?.kind === "pending_login" ? record.context.backendId : undefined;
     if (!backendId || !this.backend(backendId)) throw new AuthError("interaction_required");
     await this.managed(backendId).complete(callback, budget(DELIVERY_MS));
@@ -431,7 +477,8 @@ export class Logins {
   }
 
   /** Cancel a backend's pending logins, whichever process prepared them, and delete
-   * its grant. Its binding stays, so its next delivery knows it needs a login again. */
+   * its grant and the scopes a step-up asked for. Its binding stays, so its next
+   * delivery knows it needs a login again. True when any of that was there. */
   async logout(backendId: string): Promise<boolean> {
     const backend = this.backend(backendId);
     const context = backend && this.context(backend);
@@ -444,14 +491,23 @@ export class Logins {
     if (grantKey) {
       const index = await store.load(frame("ahp.oauth.pending-index:", [grantKey]), operation.signal);
       for (const state of index?.kind === "pending_index" ? index.states : []) {
+        // An expired login is still in the index, but there is nothing of it to cancel.
+        if ((await store.load(pendingKey(state), operation.signal))?.kind === "pending_login") removed = true;
         await this.managed(backendId).cancel({ type: "pending_login", state, authorizationUrl: "", expiresAt: 0 }, operation);
-        removed = true;
       }
       removed = await store.coordinate(grantKey, operation.signal, async () => {
         const grant: StoredRecord | undefined = await store.load(grantKey, operation.signal);
         return grant ? store.compareAndSet(grantKey, grant.generation, undefined, operation.signal) : false;
       }) || removed;
     }
+    // Scopes a step-up asked for go too: settings that no longer allow them would
+    // otherwise refuse every sign-in.
+    if ((await this.stepUp(backendId)).length) {
+      await this.#changeStepUp(backendId, () => []);
+      removed = true;
+    }
+    // Still known to need a login, but for no scopes in particular.
+    if (this.#needed.has(backendId)) this.#needed.set(backendId, undefined);
     this.#hinted.delete(backendId);
     this.#links.delete(backendId);
     return removed;

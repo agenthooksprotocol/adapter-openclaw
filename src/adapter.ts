@@ -9,7 +9,7 @@ import type { StoredRecord } from "agenthooksprotocol/oauth";
 import { loadRegistration, stateDir, type LoadedRegistration } from "./config.js";
 import { configuredPort, Logins, type PluginSettings } from "./oauth/logins.js";
 import { fileSecretStore } from "./oauth/secrets.js";
-import { keyedTokenStore, type KeyedStore } from "./oauth/store.js";
+import { keyedTokenStore, sweepLegacy, type ComparingStore, type KeyedStore } from "./oauth/store.js";
 import type { Message, NativeMessage } from "./content.js";
 import { describe, type AnyResult } from "./effects.js";
 
@@ -169,7 +169,9 @@ export class Adapter {
       const leases = state.openKeyedStore<string>({ namespace: "ahp-oauth-leases", maxEntries: 10_000 }) as unknown as KeyedStore<string>;
       // Retained state takes no TTL: pending logins expire here, each with its login.
       const pending = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth-pending", maxEntries: 10_000 }) as unknown as KeyedStore<StoredRecord>;
-      const stepUps = state.openKeyedStore<string>({ namespace: "ahp-oauth-step-up", retention: "retained" }) as unknown as KeyedStore<string>;
+      const stepUps = state.openKeyedStore<string>({ namespace: "ahp-oauth-step-up", retention: "retained" }) as unknown as ComparingStore<string>;
+      const legacy = state.openKeyedStore<string>({ namespace: "ahp-oauth-gateway", retention: "retained" }) as unknown as KeyedStore<string>;
+      void sweepLegacy(records, legacy).catch((error) => this.warn(`Agent Hooks Protocol: could not delete sign-ins left by an earlier version (${describe(error)})`));
       const directory = join(stateDir(environment) ?? state.resolveStateDir(), "plugins", PLUGIN_ID, "oauth-secrets");
       const logins = new Logins({
         store: keyedTokenStore(records, leases, { pending, warn: (text) => this.warn(text) }),

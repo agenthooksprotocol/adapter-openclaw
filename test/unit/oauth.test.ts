@@ -4,12 +4,12 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthError } from "agenthooksprotocol/client";
-import { frame, type StoredRecord } from "agenthooksprotocol/oauth";
+import { bindingKey, frame, type StoredRecord } from "agenthooksprotocol/oauth";
 import { configuredPort, Logins, type LoginHost } from "../../src/oauth/logins";
 import { privateAddress } from "../../src/oauth/network";
 import { fileSecretStore, resolveSecret } from "../../src/oauth/secrets";
 import { backendSettings, trustedIssuer } from "../../src/oauth/settings";
-import { keyedTokenStore, type KeyedStore } from "../../src/oauth/store";
+import { keyedTokenStore, sweepLegacy, type KeyedStore } from "../../src/oauth/store";
 import { callbackRoute, chatCommand, cliCommands, gatewayRunning, gatewayStopped } from "../../src/oauth/surfaces";
 
 const dir = mkdtempSync(join(tmpdir(), "ahp-openclaw-oauth-"));
@@ -36,6 +36,12 @@ class Table<T> implements KeyedStore<T> {
     return true;
   }
   async delete(key: string) { return this.rows.delete(key); }
+  async entries() {
+    return [...this.rows.keys()].flatMap((key) => {
+      const row = this.#live(key);
+      return row ? [{ key, value: row.value }] : [];
+    });
+  }
   async deleteIfEqual(key: string, expected: unknown) {
     if (this.#live(key)?.value !== expected) return false;
     return this.rows.delete(key);
@@ -460,7 +466,66 @@ describe("logins", () => {
   });
 });
 
+describe("logout", () => {
+  const backend = { id: "a", transport: { type: "http", url: "https://hooks.example/a" }, oauth: { issuer: "https://as.example" } };
+  const context = { backendId: "a", purpose: "event" as const, url: "https://hooks.example/a" };
+
+  test("says signed out only when it cancelled a login that was still pending, or deleted a grant", async () => {
+    const store = keyedTokenStore(new Table<StoredRecord>(), new Table<string>(), { pending: new Table<StoredRecord>() });
+    const instance = logins([backend], {}, { store });
+    await store.compareAndSet(bindingKey("openclaw", context), undefined, { kind: "binding", generation: "b", issuer: "https://as.example", resource: "https://hooks.example/a", discoveredAt: Date.now(), grantKey: "k" }, signal());
+    // An index naming a login that has expired: nothing to cancel.
+    await store.compareAndSet(frame("ahp.oauth.pending-index:", ["k"]), undefined, { kind: "pending_index", generation: "i", states: ["expired"] }, signal());
+    expect(await instance.logout("a")).toBe(false);
+    const pending = { kind: "pending_login", generation: "p", state: "live", grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: "https://as.example/authorize?state=live", verifier: "v", client: {} as never, metadata: {} as never, context, source: "dcr" } as StoredRecord;
+    await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "live"]), undefined, pending, signal());
+    const index = await store.load(frame("ahp.oauth.pending-index:", ["k"]), signal());
+    await store.compareAndSet(frame("ahp.oauth.pending-index:", ["k"]), index?.generation, { kind: "pending_index", generation: "j", states: ["live"] }, signal());
+    expect(await instance.logout("a")).toBe(true);
+    expect(await store.load(frame("ahp.oauth.pending:", ["openclaw", "live"]), signal())).toBeUndefined();
+    expect(await instance.logout("a")).toBe(false);
+  });
+});
+
+describe("an earlier version's state", () => {
+  test("its pending logins and Gateway redirects are deleted once; grants and bindings stay", async () => {
+    const records = new Table<StoredRecord>(), gateway = new Table<string>();
+    const old = { kind: "pending_login", generation: "p", state: "s", verifier: "v" } as unknown as StoredRecord;
+    await records.register("grant", grant("g"));
+    await records.register("binding", { kind: "binding", generation: "b", issuer: "https://as", resource: "https://r", discoveredAt: 0 });
+    await records.register("index", { kind: "pending_index", generation: "i", states: [] });
+    await records.register("old-pending", old);
+    await gateway.register("redirect", "http://127.0.0.1:18789/ahp/oauth/callback");
+    await sweepLegacy(records, gateway);
+    expect([...records.rows.keys()].sort()).toEqual(["binding", "grant", "index"]);
+    expect([...gateway.rows.keys()]).toHaveLength(1);
+    expect(await gateway.lookup("redirect")).toBeUndefined();
+    // Once: a later open reads nothing.
+    let read = false;
+    records.entries = async () => { read = true; return []; };
+    await sweepLegacy(records, gateway);
+    expect(read).toBe(false);
+  });
+});
+
 describe("openclaw ahp", () => {
+  test("asks for the Gateway on its loopback port where publicUrl is set, which this host may not reach", async () => {
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("not signed in", { status: 400 }) });
+    const http = { id: "a", transport: { type: "http", url: "https://hooks.example/a" }, oauth: { issuer: "https://as.example" } };
+    const port = server.port;
+    try {
+      const behindProxy = logins([http], { publicUrl: "https://gw.invalid" }, { port: () => port! });
+      expect(behindProxy.redirectUri).toBe("https://gw.invalid/ahp/oauth/callback");
+      expect(behindProxy.loopbackUri).toBe(`http://127.0.0.1:${port}/ahp/oauth/callback`);
+      expect(await gatewayStopped(behindProxy)).toBeUndefined();
+    } finally {
+      server.stop(true);
+    }
+    const stopped = await gatewayStopped(logins([http], { publicUrl: "https://gw.invalid" }, { port: () => port! }), 500);
+    expect(stopped).toContain(`No Gateway answers at http://127.0.0.1:${port} or at https://gw.invalid (publicUrl)`);
+    expect(stopped).toContain("OPENCLAW_GATEWAY_PORT");
+  });
+
   test("knows whether the Gateway answers at the redirect", async () => {
     const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("not signed in", { status: 400 }) });
     try {
@@ -483,13 +548,17 @@ describe("step-up", () => {
       return {
         prepare: async (_context: unknown, _budget: unknown, options: { requiredScopes?: readonly string[] }) => {
           this.prepared.push(options.requiredScopes);
+          // Settings that no longer allow a scope asked for.
+          if (options.requiredScopes?.some((scope) => !this.allowed.includes(scope))) throw new AuthError("access_denied");
           return this.ready ? { type: "ready" } : { type: "pending_login", state: "s", authorizationUrl: "https://as.example/authorize?state=s", expiresAt: Date.now() + 60_000 };
         },
         complete: async () => ({ type: "ready" }),
       } as never;
     }
     ready = false;
+    allowed = ["hooks:read", "hooks:write", "hooks:admin"];
   }
+  const pendingLogin = (state: string, requiredScopes: string[]): StoredRecord => ({ kind: "pending_login", generation: "g", state, grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: `https://as.example/authorize?state=${state}`, verifier: "v", client: { requiredScopes } as never, metadata: {} as never, context: { backendId: "a", purpose: "event", url: "https://hooks.example/a" }, source: "dcr" } as StoredRecord);
   const shared = () => ({ records: new Table<StoredRecord>(), stepUps: new Table<string>() });
   const open = (state: ReturnType<typeof shared>, warn: (text: string) => void = () => {}) => new Process({ store: keyedTokenStore(state.records, new Table<string>()), stepUps: state.stepUps, secrets: fileSecretStore(join(dir, "s5")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend] as never, log: () => {}, warn });
 
@@ -526,6 +595,52 @@ describe("step-up", () => {
     expect(await cli.login("a")).toEqual({ type: "ready" });
     expect(cli.prepared).toEqual([["hooks:admin"]]);
     expect(await cli.stepUp("a")).toEqual([]);
+  });
+
+  test("step-ups the Gateway and the CLI record at once both keep their scopes", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state), other = open(state);
+    await Promise.all([gateway.needsLogin("a", ["hooks:write"]), cli.needsLogin("a", ["hooks:admin"]), other.needsLogin("a", ["hooks:read"])]);
+    expect(await cli.stepUp("a")).toEqual(["hooks:admin", "hooks:read", "hooks:write"]);
+    // And in one process, a later step-up adds to the scopes an earlier one asked for.
+    gateway.signedIn = false;
+    await gateway.needsLogin("a");
+    expect(await gateway.login("a")).toMatchObject({ type: "pending", requiredScopes: ["hooks:write", "hooks:admin", "hooks:read"] });
+  });
+
+  test("a sign-in clears only the scopes it was for: one asked for while it was open stays, and the sign-in still finishes", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    const store = keyedTokenStore(state.records, new Table<string>());
+    await gateway.needsLogin("a", ["hooks:write"]);
+    const login = await cli.login("a");
+    expect(login).toMatchObject({ type: "pending", state: "s", requiredScopes: ["hooks:write"] });
+    await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), undefined, pendingLogin("s", ["hooks:write"]), signal());
+    // While the link is open, a delivery asks for more.
+    await gateway.needsLogin("a", ["hooks:admin"]);
+    expect(await cli.finished(backend as never, login as never)).toBe(false);
+    expect(await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s")).toBe("a");
+    expect(await cli.stepUp("a")).toEqual(["hooks:admin"]);
+    // The SDK's completion consumes the pending login.
+    await store.compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), "g", undefined, signal());
+    expect(await cli.finished(backend as never, login as never)).toBe(true);
+    // An expired link, its scopes still asked for, has not finished.
+    expect(await cli.finished(backend as never, { state: "s", requiredScopes: ["hooks:admin"] })).toBe(false);
+  });
+
+  test("scopes the backend's settings no longer allow say how to recover, and logout forgets them", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    await gateway.needsLogin("a", ["hooks:admin"]);
+    cli.allowed = ["hooks:read", "hooks:write"];
+    const refused = cli.login("a");
+    await expect(refused).rejects.toThrow("asked for scopes its OAuth settings do not allow (hooks:admin)");
+    await expect(refused).rejects.toThrow("openclaw ahp logout a");
+    // Nothing else is stored: the step-up alone is what logout removes.
+    expect(await cli.logout("a")).toBe(true);
+    expect(state.stepUps.rows.size).toBe(0);
+    expect(await cli.login("a")).toMatchObject({ type: "pending", requiredScopes: [] });
+    expect(await cli.logout("a")).toBe(false);
   });
 
   test("a sign-in a 401 asked for, with no scopes, keeps nothing", async () => {
@@ -572,7 +687,7 @@ describe("openclaw ahp login with no Gateway to return to", () => {
     server.stop(true);
     const redirectUri = `http://127.0.0.1:${port}/ahp/oauth/callback`;
     let prepared = 0;
-    const logins = { redirectUri, login: async () => { prepared += 1; return { type: "pending", url: "https://as.example/authorize?state=s", expiresAt: Date.now() + 60_000 }; }, waiting: async () => [{ id: "a" }] };
+    const logins = { redirectUri, loopbackUri: redirectUri, login: async () => { prepared += 1; return { type: "pending", url: "https://as.example/authorize?state=s", expiresAt: Date.now() + 60_000 }; }, waiting: async () => [{ id: "a" }] };
     const { root, actions } = program();
     cliCommands(root, () => logins as never, () => [{ id: "a" }]);
     const printed: string[] = [];
@@ -590,6 +705,6 @@ describe("openclaw ahp login with no Gateway to return to", () => {
     expect(printed[0]).toContain(`No Gateway answers at http://127.0.0.1:${port}`);
     for (const name of ["OPENCLAW_GATEWAY_PORT", "gateway.port", "publicUrl"]) expect(printed[0]).toContain(name);
     expect(printed.join("\n")).not.toContain("/authorize");
-    expect(await gatewayStopped({ redirectUri })).toBe(printed[0]);
+    expect(await gatewayStopped({ redirectUri, loopbackUri: redirectUri })).toBe(printed[0]);
   });
 });

@@ -18,6 +18,31 @@ export interface KeyedStore<T> {
     | { operation: "update"; action: "set"; value: T; ttlMs?: number }
     | { operation: "update" | "delete"; action: "keep" }
     | { operation: "delete"; action: "delete" }) => Promise<{ status: "applied" | "unchanged" } | { status: "conflict"; current: { value: T | undefined; comparison: string } }>;
+  entries?: () => Promise<{ key: string; value: T }[]>;
+}
+
+/** A keyed store with compare-and-apply, as every supported OpenClaw has. */
+export type ComparingStore<T> = KeyedStore<T> & Required<Pick<KeyedStore<T>, "observe" | "compareAndApply">>;
+
+/** Marks the sweep below as done, in the namespace it empties. */
+const SWEPT = "swept:agenthooksprotocol-0.14";
+
+/**
+ * On agenthooksprotocol 0.14 and before, pending logins, PKCE verifier and all, were
+ * kept in the retained `records` namespace, keyed by binding, and the Gateway's
+ * redirect in `gateway`. Nothing reads either now: delete them once, so a verifier
+ * is not kept forever. Grants, bindings and registrations stay.
+ */
+export async function sweepLegacy(records: KeyedStore<StoredRecord>, gateway: KeyedStore<string>): Promise<void> {
+  if (!records.entries || !gateway.entries || await gateway.lookup(SWEPT) !== undefined) return;
+  for (const { key, value } of await records.entries()) {
+    // A pending login is written to its own namespace now: one here is the old format.
+    if (value?.kind === "pending_login") await records.delete(key);
+  }
+  for (const { key } of await gateway.entries()) {
+    if (key !== SWEPT) await gateway.delete(key);
+  }
+  await gateway.register(SWEPT, new Date().toISOString());
 }
 
 /** A lease outlives a crashed holder by at most this long. */

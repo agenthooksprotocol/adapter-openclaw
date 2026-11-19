@@ -127,10 +127,15 @@ export function cliCommands(program: Command, logins: () => Logins, backends: ()
           continue;
         }
         console.log(`Sign in to ${target.id}: ${result.url}`);
-        if (!(await waitForLogin(current, target.id, result.expiresAt))) {
+        if (!(await waitForLogin(current, target.id, result))) {
           failed = true;
           console.log(`${target.id}: the link expired before sign-in finished`);
-        } else console.log(`${target.id}: signed in`);
+          continue;
+        }
+        console.log(`${target.id}: signed in`);
+        // A delivery asked for more while this sign-in was open.
+        const status = await current.status(current.backend(target.id)!);
+        if (status.state === "needs-login" && status.scopes?.length) console.log(`${target.id}: it has since asked for ${status.scopes.join(" ")} too: run \`openclaw ahp login ${target.id}\` again`);
       }
       if (failed) process.exitCode = 1;
     });
@@ -143,10 +148,10 @@ export function cliCommands(program: Command, logins: () => Logins, backends: ()
   });
 }
 
-/** Whether something answers at the redirect: the Gateway, if it is running. */
-export async function gatewayRunning(redirectUri: string, timeoutMs = 2000): Promise<boolean> {
+/** Whether something answers at an address: the Gateway, if it is running. */
+export async function gatewayRunning(uri: string, timeoutMs = 2000): Promise<boolean> {
   try {
-    await fetch(redirectUri, { signal: AbortSignal.timeout(timeoutMs), redirect: "manual" });
+    await fetch(uri, { signal: AbortSignal.timeout(timeoutMs), redirect: "manual" });
     return true;
   } catch {
     return false;
@@ -154,14 +159,21 @@ export async function gatewayRunning(redirectUri: string, timeoutMs = 2000): Pro
 }
 
 /** For `openclaw ahp`: a link returns to the Gateway, where config says it is. Why
- * not, when nothing answers there. */
-export async function gatewayStopped(logins: Pick<Logins, "redirectUri">, timeoutMs?: number): Promise<string | undefined> {
+ * not, when nothing answers there. Asked on the loopback port, which this host
+ * reaches even where it cannot reach its own `publicUrl`; at `publicUrl` only if
+ * nothing answers on loopback (a Gateway bound to another interface). */
+export async function gatewayStopped(logins: Pick<Logins, "redirectUri" | "loopbackUri">, timeoutMs?: number): Promise<string | undefined> {
+  if (await gatewayRunning(logins.loopbackUri, timeoutMs)) return undefined;
+  const loopback = new URL(logins.loopbackUri).origin;
+  if (logins.redirectUri === logins.loopbackUri) {
+    return `No Gateway answers at ${loopback}, where a sign-in returns. Start the Gateway, or if it runs elsewhere, set OPENCLAW_GATEWAY_PORT or gateway.port to its port (or publicUrl to the address a browser reaches it at), then run this again.`;
+  }
   if (await gatewayRunning(logins.redirectUri, timeoutMs)) return undefined;
-  return `No Gateway answers at ${new URL(logins.redirectUri).origin}, where a sign-in returns. Start the Gateway, or if it runs elsewhere, set OPENCLAW_GATEWAY_PORT or gateway.port to its port (or publicUrl to the address a browser reaches it at), then run this again.`;
+  return `No Gateway answers at ${loopback} or at ${new URL(logins.redirectUri).origin} (publicUrl), where a sign-in returns. Start the Gateway, or set OPENCLAW_GATEWAY_PORT or gateway.port to the port it listens on, then run this again.`;
 }
 
 /** Until the Gateway (or a pasted address, on a terminal) completes the login. */
-async function waitForLogin(logins: Logins, id: string, expiresAt: number): Promise<boolean> {
+async function waitForLogin(logins: Logins, id: string, login: { expiresAt: number; state: string; requiredScopes: readonly string[] }): Promise<boolean> {
   const backend = logins.backend(id)!;
   let pasted: Promise<void> | undefined;
   const lines = process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stdout }) : undefined;
@@ -175,9 +187,9 @@ async function waitForLogin(logins: Logins, id: string, expiresAt: number): Prom
     });
   });
   try {
-    while (Date.now() < expiresAt) {
+    while (Date.now() < login.expiresAt) {
       await pasted;
-      if ((await logins.status(backend)).state === "authorized") return true;
+      if (await logins.finished(backend, login)) return true;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     return false;
