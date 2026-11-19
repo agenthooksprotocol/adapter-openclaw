@@ -636,6 +636,24 @@ describe("step-up", () => {
     expect(await cli.finished(backend as never, { state: "t" })).toBe(false);
   });
 
+  test("a completion is recorded only after the scopes it answers are cleared", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    await gateway.needsLogin("a", ["hooks:write"]);
+    const login = await cli.login("a");
+    await keyedTokenStore(state.records, new Table<string>()).compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), undefined, pendingLogin("s", ["hooks:write"]), signal());
+    // What a CLI polling at the moment the completion lands would see.
+    const seen: (readonly string[])[] = [];
+    const register = state.completions.register.bind(state.completions);
+    state.completions.register = async (key, value, opts) => {
+      seen.push(await cli.stepUp("a"));
+      return register(key, value, opts);
+    };
+    await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s");
+    expect(seen).toEqual([[]]);
+    expect(await cli.finished(backend as never, login as never)).toBe(true);
+  });
+
   test("a sign-in finishes on its completion even if a delivery asks for its own scopes again", async () => {
     const state = shared();
     const gateway = open(state), cli = open(state);
@@ -692,9 +710,11 @@ describe("step-up", () => {
     expect(await cli.stepUp("a")).toEqual(["hooks:admin"]);
   });
 
-  test("through the SDK: a step-up for a scope outside the backend's `oauth.scopes` names it, and says how to recover", async () => {
+  /** The real managed OAuth, over a backend allowed `hooks:read hooks:write` and its
+   * authorization server, as their metadata says: only the network is faked. The
+   * backend's 401 asks for `challenge`, if given. */
+  function sdkWorld(challenge?: string) {
     const real = { id: "a", transport: { type: "http", url: "https://hooks.example/a" }, oauth: { issuer: "https://as.example", clientId: "openclaw", scopes: ["hooks:read", "hooks:write"] } };
-    /** The backend and its authorization server, as their metadata says: nothing else is faked. */
     const served = (url: string): Response => {
       const { origin, pathname } = new URL(url);
       if (origin === "https://hooks.example" && pathname.startsWith("/.well-known/oauth-protected-resource")) {
@@ -703,10 +723,13 @@ describe("step-up", () => {
       if (origin === "https://as.example" && pathname === "/.well-known/oauth-authorization-server") {
         return Response.json({ issuer: "https://as.example", authorization_endpoint: "https://as.example/authorize", token_endpoint: "https://as.example/token", response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none"] });
       }
-      if (origin === "https://hooks.example") return new Response(null, { status: 401, headers: { "www-authenticate": 'Bearer resource_metadata="https://hooks.example/.well-known/oauth-protected-resource/a"' } });
+      if (origin === "https://hooks.example") {
+        return new Response(null, { status: 401, headers: { "www-authenticate": `Bearer resource_metadata="https://hooks.example/.well-known/oauth-protected-resource/a"${challenge ? `, scope="${challenge}"` : ""}` } });
+      }
       return new Response(null, { status: 404 });
     };
     class Sdk extends Logins {
+      constructor(readonly host: LoginHost) { super(host); }
       override managed() {
         return managedOAuth({
           namespace: "openclaw",
@@ -718,18 +741,48 @@ describe("step-up", () => {
           persistPendingLogins: true,
         });
       }
-      constructor(readonly host: LoginHost) { super(host); }
     }
     const state = shared();
     const host: LoginHost = { store: keyedTokenStore(state.records, new Table<string>(), { pending: new Table<StoredRecord>() }), stepUps: state.stepUps, completions: state.completions, secrets: fileSecretStore(join(dir, "s6")), settings: {}, environment: {}, port: () => 18789, backends: () => [real] as never, log: () => {}, warn: () => {} };
-    const cli = new Sdk(host);
+    return () => new Sdk(host);
+  }
+
+  test("through the SDK: a step-up for a scope outside the backend's `oauth.scopes` names it, and says how to recover", async () => {
+    const process = sdkWorld();
     // Within what the backend may be granted, the SDK prepares a login.
-    expect(await cli.login("a")).toMatchObject({ type: "pending", requiredScopes: [] });
-    const gateway = new Sdk(host);
-    await gateway.needsLogin("a", ["hooks:admin"]);
-    const refused = new Sdk(host).login("a");
-    await expect(refused).rejects.toThrow("a asked for scopes its OAuth settings do not allow (hooks:admin): run `openclaw ahp logout a`");
+    expect(await process().login("a")).toMatchObject({ type: "pending", requiredScopes: [] });
+    await process().needsLogin("a", ["hooks:admin"]);
+    const refused = process().login("a");
+    await expect(refused).rejects.toThrow("a asked for scopes its OAuth settings do not allow (hooks:admin): run `openclaw ahp logout a` to forget them, or add them to its `oauth.scopes` in hooks.json");
     await expect(refused).rejects.toMatchObject({ cause: { code: "access_denied", requiredScopes: ["hooks:admin"] } });
+  });
+
+  test("through the SDK: of a step-up's scopes, only the refused ones are named", async () => {
+    const process = sdkWorld();
+    await process().needsLogin("a", ["hooks:write", "hooks:admin"]);
+    const refused = process().login("a");
+    await expect(refused).rejects.toThrow("a asked for scopes its OAuth settings do not allow (hooks:admin): run `openclaw ahp logout a`");
+    await expect(refused).rejects.toMatchObject({ cause: { requiredScopes: ["hooks:admin", "hooks:write"] } });
+  });
+
+  test("through the SDK: a scope the backend's own 401 asks for is refused at delivery, keeps no step-up, and needs no logout", async () => {
+    const process = sdkWorld("hooks:read hooks:admin");
+    const gateway = process();
+    const response = new Response(null, { status: 401, headers: { "www-authenticate": 'Bearer resource_metadata="https://hooks.example/.well-known/oauth-protected-resource/a", scope="hooks:read hooks:admin"' } });
+    const refused = await gateway.managed().challenge({ backendId: "a", purpose: "event", url: "https://hooks.example/a", response } as never, { signal: AbortSignal.timeout(5_000), deadline: Date.now() + 5_000 })
+      .then(() => undefined, (error: AuthError) => error);
+    // Not a login's to fix: the adapter records a step-up only for recovery "login".
+    expect(refused).toMatchObject({ code: "access_denied", recovery: "none", requiredScopes: ["hooks:admin", "hooks:read"] });
+    expect(await gateway.stepUp("a")).toEqual([]);
+    expect(await process().login("a")).toMatchObject({ type: "pending", requiredScopes: [] });
+  });
+
+  test("a refusal for scopes no step-up kept says to allow them, not to log out", async () => {
+    const state = shared();
+    const cli = open(state);
+    cli.managed = () => ({ prepare: async () => { throw new AuthError("access_denied", ["hooks:admin", "hooks:read"]); } }) as never;
+    const refused = await cli.login("a").then(() => undefined, (error: Error) => error);
+    expect(refused?.message).toBe("a asked for scopes its OAuth settings do not allow (hooks:admin): add them to its `oauth.scopes` in hooks.json");
   });
 
   test("a sign-in a 401 asked for, with no scopes, keeps nothing", async () => {

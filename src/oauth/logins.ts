@@ -212,6 +212,13 @@ export class Logins {
     return auth.compose({ bearer: auth.bearer({ resolveCredentialReference }), oauth: this.#route, discover: this.#route });
   }
 
+  /** The scopes a backend may be granted, as selectClient gives them: its `oauth`
+   * object's, else its preset's. No `allowedScopes` is set, so these are the ceiling. */
+  #scopes(context: DeliveryAuthContext): readonly string[] {
+    const preset = context.authentication?.type === "oauth" ? context.authentication : undefined;
+    return this.#for(context.backendId).settings.scopes ?? preset?.scopes ?? [];
+  }
+
   /** Local trust policy: only a backend the operator set up for OAuth, at the issuer
    * they named. The `oauth` object's settings take precedence over the preset's. */
   selectClient(issuers: readonly string[], resource: string, context: DeliveryAuthContext): ClientConfig {
@@ -237,7 +244,7 @@ export class Logins {
       issuer,
       resource: preset?.resource ?? resource,
       flow,
-      scopes: settings.scopes ?? preset?.scopes ?? [],
+      scopes: this.#scopes(context),
       // One consent per backend, for its event and upload endpoints alike.
       grantPartition: context.backendId,
       ...(clientId ? { clientId } : {}),
@@ -385,11 +392,20 @@ export class Logins {
       try {
         result = await this.managed(backendId).prepare(context, budget(PREPARE_MS), { redirectUri: this.redirectUri, ...(requiredScopes.length ? { requiredScopes } : {}) });
       } catch (error) {
-        // Scopes this backend's settings do not allow, which the SDK names: kept from a
-        // step-up, asking again would be refused every time. Any other refusal (no
-        // OAuth settings, an untrusted issuer) is not about scopes.
+        // A refusal for scopes this backend's settings do not allow: the SDK names every
+        // scope the login required, of which these are the refused ones. Any other
+        // refusal (no OAuth settings, an untrusted issuer) is not about scopes.
         if (error instanceof AuthError && error.code === "access_denied" && error.requiredScopes?.length) {
-          throw new Error(`${backendId} asked for scopes its OAuth settings do not allow (${error.requiredScopes.join(" ")}): run \`openclaw ahp logout ${backendId}\` to forget them, or add them to its \`oauth.scopes\` in hooks.json`, { cause: error });
+          const allowed = this.#scopes(context);
+          const refused = error.requiredScopes.filter((scope) => !allowed.includes(scope));
+          const named = refused.length ? refused : error.requiredScopes;
+          // Kept from a step-up, logout forgets them; asked for by the backend itself
+          // (its 401), there is nothing to forget.
+          const kept = named.some((scope) => requiredScopes.includes(scope));
+          const fix = kept
+            ? `run \`openclaw ahp logout ${backendId}\` to forget them, or add them to its \`oauth.scopes\` in hooks.json`
+            : `add them to its \`oauth.scopes\` in hooks.json`;
+          throw new Error(`${backendId} asked for scopes its OAuth settings do not allow (${named.join(" ")}): ${fix}`, { cause: error });
         }
         throw error;
       }
@@ -476,12 +492,13 @@ export class Logins {
     const backendId = record?.kind === "pending_login" ? record.context.backendId : undefined;
     if (!backendId || !this.backend(backendId)) throw new AuthError("interaction_required");
     await this.managed(backendId).complete(callback, budget(DELIVERY_MS));
-    // For `openclaw ahp login`, which waits on this login, whichever process it runs in.
+    // Completed: the grant covers the scopes this login required.
+    await this.#steppedUp(backendId, record?.kind === "pending_login" ? record.client.requiredScopes ?? [] : []);
+    // For `openclaw ahp login`, which waits on this login, whichever process it runs in:
+    // only now, so the step-up it sees next holds only what was asked for since.
     const ttlMs = Math.max(0, (record?.kind === "pending_login" ? record.expiresAt : Date.now()) - Date.now()) + COMPLETION_MS;
     await this.#host.completions.register(completionKey(state!), backendId, { ttlMs })
       .catch((error) => this.#host.warn(`Agent Hooks Protocol: ${backendId}: signed in, but could not record it (${describe(error)})`));
-    // Completed: the grant covers the scopes this login required.
-    await this.#steppedUp(backendId, record?.kind === "pending_login" ? record.client.requiredScopes ?? [] : []);
     this.#ready(backendId);
     this.initializationFailed.delete(backendId);
     return backendId;
