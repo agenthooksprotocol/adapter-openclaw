@@ -876,7 +876,8 @@ describe("openclaw ahp login with no Gateway to return to", () => {
       expect(globalThis.process.exitCode).toBe(1);
     } finally {
       console.log = log;
-      globalThis.process.exitCode = exitCode;
+      // Bun ignores `exitCode = undefined`, which would fail the whole run.
+      globalThis.process.exitCode = exitCode ?? 0;
     }
     expect(prepared).toBe(0);
     expect(printed).toHaveLength(1);
