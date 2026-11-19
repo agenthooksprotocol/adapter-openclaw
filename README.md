@@ -110,11 +110,18 @@ openclaw ahp complete <url>    # finish with the address the browser ended on, i
 openclaw ahp logout <backend>  # cancel its pending sign-in and delete its tokens
 ```
 
-`openclaw ahp status` and `login` say so when the Gateway is not running, since a
-link returns to it. `openclaw ahp login` on a terminal also accepts that address
-pasted in. In chat, the
+A link returns to the Gateway, so `openclaw ahp status` says so when nothing
+answers where config puts it, and `openclaw ahp login` then stops before it
+registers a client or prints a link: start the Gateway, or point the CLI at it with
+`OPENCLAW_GATEWAY_PORT`, `gateway.port` or `publicUrl`. `openclaw ahp login` on a
+terminal also accepts the address the browser ended on, pasted in. In chat, the
 owner's `/ahp status`, `/ahp login [backend]` and `/ahp logout <backend>` do the same,
 without ever putting a link in the reply: `/ahp login` points at `openclaw ahp login`.
+
+A backend that answers a signed-in delivery with `403 insufficient_scope` needs a
+sign-in for more scopes (a step-up). The Gateway keeps the scopes it asked for in
+plugin state, so `openclaw ahp status` shows `needs-login for <scopes>` and
+`openclaw ahp login` asks for them, until a grant that covers them is stored.
 
 Without a person (CI, `openclaw agent --local` in a script), the hint is only
 logged: use client credentials. `openclaw agent exec` runs with a temporary state
@@ -163,9 +170,11 @@ What is OpenClaw's alone goes in the plugin config,
 
 ### Where credentials live
 
-- Tokens, refresh tokens, pending sign-ins, discovery results and registered client
-  ids: OpenClaw's plugin state (the `ahp-oauth` namespace of its state database under
-  `~/.openclaw`, or `$OPENCLAW_STATE_DIR`), shared by the Gateway and `openclaw ahp`.
+- Tokens, refresh tokens, discovery results and registered client ids: OpenClaw's
+  plugin state (the `ahp-oauth` namespace of its state database under `~/.openclaw`,
+  or `$OPENCLAW_STATE_DIR`), shared by the Gateway and `openclaw ahp`. Pending
+  sign-ins, which hold the PKCE verifier, are in `ahp-oauth-pending`, and expire with
+  their link. Scopes a step-up asked for are in `ahp-oauth-step-up`.
   A short-lived lease row (`ahp-oauth-leases`), renewed atomically while held, keeps
   the two from refreshing or completing the same grant at once; a holder that loses
   its lease says so in the log, and its writes still go through only where the record's

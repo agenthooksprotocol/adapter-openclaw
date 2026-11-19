@@ -10,7 +10,7 @@ import { privateAddress } from "../../src/oauth/network";
 import { fileSecretStore, resolveSecret } from "../../src/oauth/secrets";
 import { backendSettings, trustedIssuer } from "../../src/oauth/settings";
 import { keyedTokenStore, type KeyedStore } from "../../src/oauth/store";
-import { callbackRoute, gatewayRunning } from "../../src/oauth/surfaces";
+import { callbackRoute, chatCommand, cliCommands, gatewayRunning, gatewayStopped } from "../../src/oauth/surfaces";
 
 const dir = mkdtempSync(join(tmpdir(), "ahp-openclaw-oauth-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -78,6 +78,32 @@ describe("the token store", () => {
     expect(await store.load("k", signal())).toBeUndefined();
     // Deleting what is absent, expecting absence, holds.
     expect(await store.compareAndSet("k", undefined, undefined, signal())).toBe(true);
+  });
+
+  test("a pending login, which holds the PKCE verifier, is kept apart and expires with the login; a grant does not expire", async () => {
+    const records = new Table<StoredRecord>(), pending = new Table<StoredRecord>();
+    const store = keyedTokenStore(records, new Table<string>(), { pending });
+    const key = frame("ahp.oauth.pending:", ["openclaw", "s"]);
+    const login: StoredRecord = { kind: "pending_login", generation: "1", state: "s", grantKey: "k", expiresAt: Date.now() + 100, authorizationUrl: "https://as.example/authorize?state=s", verifier: "v", client: {} as never, metadata: {} as never, context: { backendId: "a", purpose: "event", url: "https://hooks.example/a" }, source: "dcr" };
+    expect(await store.compareAndSet(key, undefined, login, signal())).toBe(true);
+    expect(await store.compareAndSet(frame("ahp.oauth.pending-index:", ["k"]), undefined, { kind: "pending_index", generation: "1", states: ["s"] }, signal())).toBe(true);
+    expect(await store.compareAndSet("ahp.oauth.grant:k", undefined, grant("1"), signal())).toBe(true);
+    const [row] = [...pending.rows.values()];
+    expect(pending.rows.size).toBe(1);
+    expect(row!.expiresAt! - Date.now()).toBeGreaterThan(0);
+    expect(row!.expiresAt! - Date.now()).toBeLessThanOrEqual(100);
+    // The index and the grant are retained, with no expiry.
+    expect(records.rows.size).toBe(2);
+    expect([...records.rows.values()].every((stored) => stored.expiresAt === undefined)).toBe(true);
+    expect((await store.load(key, signal()))?.kind).toBe("pending_login");
+    await Bun.sleep(120);
+    expect(await store.load(key, signal())).toBeUndefined();
+    expect(pending.rows.size).toBe(0);
+    expect(await store.load("ahp.oauth.grant:k", signal())).toBeDefined();
+    // A claimed login is deleted from where it is kept.
+    expect(await store.compareAndSet(key, undefined, { ...login, expiresAt: Date.now() + 60_000 }, signal())).toBe(true);
+    expect(await store.compareAndSet(key, "1", undefined, signal())).toBe(true);
+    expect(pending.rows.size).toBe(0);
   });
 
   test("keys are stored as digests, never as given", async () => {
@@ -260,6 +286,7 @@ describe("settings", () => {
 function logins(backends: Record<string, unknown>[], settings = {}, extra: Partial<LoginHost> = {}): Logins {
   const host: LoginHost = {
     store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()),
+    stepUps: new Table<string>(),
     secrets: fileSecretStore(join(dir, "s")),
     settings: { secrets: { "the-secret": "shh" }, ...settings },
     environment: {},
@@ -404,7 +431,7 @@ describe("logins", () => {
       override async status() { return { state: "authorized" as const }; }
       override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
-    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
+    const instance = new Signed({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), secrets: fileSecretStore(join(dir, "s3")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: (text) => logged.push(text), warn: (text) => logged.push(text) });
     instance.initializationFailed.add("a");
     await instance.hint();
     expect(prepared).toEqual(["a"]);
@@ -421,7 +448,7 @@ describe("logins", () => {
       override async status() { return { state }; }
       override async login(id: string) { prepared.push(id); return { type: "ready" as const }; }
     }
-    const instance = new Waiting({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
+    const instance = new Waiting({ store: keyedTokenStore(new Table<StoredRecord>(), new Table<string>()), stepUps: new Table<string>(), secrets: fileSecretStore(join(dir, "s4")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend("a")] as never, log: () => {}, warn: (text) => warnings.push(text) });
     await instance.hint();
     await instance.hint();
     state = "authorized";
@@ -442,5 +469,127 @@ describe("openclaw ahp", () => {
       server.stop(true);
     }
     expect(await gatewayRunning(`http://127.0.0.1:${server.port}/ahp/oauth/callback`, 500)).toBe(false);
+  });
+});
+
+describe("step-up", () => {
+  const backend = { id: "a", transport: { type: "http", url: "https://hooks.example/a" }, oauth: { issuer: "https://as.example", scopes: ["hooks:read", "hooks:write"] } };
+  /** A process with an old grant, and a fake managed OAuth that grants what a login required. */
+  class Process extends Logins {
+    readonly prepared: (readonly string[] | undefined)[] = [];
+    signedIn = true;
+    override credential() { return Promise.resolve(this.signedIn ? { type: "bearer" as const } as never : undefined); }
+    override managed() {
+      return {
+        prepare: async (_context: unknown, _budget: unknown, options: { requiredScopes?: readonly string[] }) => {
+          this.prepared.push(options.requiredScopes);
+          return this.ready ? { type: "ready" } : { type: "pending_login", state: "s", authorizationUrl: "https://as.example/authorize?state=s", expiresAt: Date.now() + 60_000 };
+        },
+        complete: async () => ({ type: "ready" }),
+      } as never;
+    }
+    ready = false;
+  }
+  const shared = () => ({ records: new Table<StoredRecord>(), stepUps: new Table<string>() });
+  const open = (state: ReturnType<typeof shared>, warn: (text: string) => void = () => {}) => new Process({ store: keyedTokenStore(state.records, new Table<string>()), stepUps: state.stepUps, secrets: fileSecretStore(join(dir, "s5")), settings: {}, environment: {}, port: () => 18789, backends: () => [backend] as never, log: () => {}, warn });
+
+  test("scopes a Gateway delivery asked for reach `openclaw ahp login` in another process, which prepares a step-up", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    await gateway.needsLogin("a", ["hooks:write"]);
+    await gateway.needsLogin("a", ["hooks:admin", "hooks:write"]);
+    // Signed in, but not for what was asked: the CLI and /ahp both see it.
+    expect(await cli.status(backend as never)).toEqual({ state: "needs-login", scopes: ["hooks:admin", "hooks:write"] });
+    expect((await cli.waiting()).map((waiting) => waiting.id)).toEqual(["a"]);
+    const result = await cli.login("a");
+    expect(result.type).toBe("pending");
+    expect(cli.prepared).toEqual([["hooks:admin", "hooks:write"]]);
+  });
+
+  test("a stored grant that covers them clears them: at the Gateway's completion, or at a prepare that finds it", async () => {
+    const state = shared();
+    const gateway = open(state), cli = open(state);
+    await gateway.needsLogin("a", ["hooks:write"]);
+    // The Gateway completes a login that required the scopes.
+    const context = { backendId: "a", purpose: "event" as const, url: "https://hooks.example/a" };
+    await keyedTokenStore(state.records, new Table<string>()).compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "s"]), undefined, { kind: "pending_login", generation: "g", state: "s", grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: "https://as.example/authorize?state=s", verifier: "v", client: { requiredScopes: ["hooks:write"] } as never, metadata: {} as never, context, source: "dcr" }, signal());
+    expect(await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=s")).toBe("a");
+    expect(state.stepUps.rows.size).toBe(0);
+    expect(await cli.status(backend as never)).toEqual({ state: "authorized" });
+
+    // One a login did not require stays; a prepare that finds a grant covering it clears it.
+    await gateway.needsLogin("a", ["hooks:admin"]);
+    await keyedTokenStore(state.records, new Table<string>()).compareAndSet(frame("ahp.oauth.pending:", ["openclaw", "t"]), undefined, { kind: "pending_login", generation: "g", state: "t", grantKey: "k", expiresAt: Date.now() + 60_000, authorizationUrl: "https://as.example/authorize?state=t", verifier: "v", client: { requiredScopes: ["hooks:write"] } as never, metadata: {} as never, context, source: "dcr" }, signal());
+    await gateway.complete("http://127.0.0.1:18789/ahp/oauth/callback?code=c&state=t");
+    expect(await cli.stepUp("a")).toEqual(["hooks:admin"]);
+    cli.ready = true;
+    expect(await cli.login("a")).toEqual({ type: "ready" });
+    expect(cli.prepared).toEqual([["hooks:admin"]]);
+    expect(await cli.stepUp("a")).toEqual([]);
+  });
+
+  test("a sign-in a 401 asked for, with no scopes, keeps nothing", async () => {
+    const state = shared();
+    const gateway = open(state);
+    await gateway.needsLogin("a");
+    gateway.signedIn = false;
+    expect(state.stepUps.rows.size).toBe(0);
+    expect(await gateway.status(backend as never)).toEqual({ state: "needs-login" });
+  });
+});
+
+describe("/ahp in chat", () => {
+  test("is for the Gateway's owner only, and reads nothing for anyone else", async () => {
+    let read = false;
+    const command = chatCommand(() => { read = true; return {} as never; }, () => []);
+    for (const ctx of [{ args: "status" }, { args: "logout a", senderIsOwner: false }, { args: "login", gatewayClientScopes: ["operator.read"] }]) {
+      expect((await command(ctx)).text).toBe("Only the Gateway's owner can manage Agent Hooks Protocol sign-in.");
+    }
+    expect(read).toBe(false);
+    const owner = chatCommand(() => ({ status: async () => ({ state: "authorized" }) }) as never, () => [{ id: "a" }]);
+    expect((await owner({ args: "status", senderIsOwner: true })).text).toBe("a: authorized");
+    expect((await owner({ args: "status", gatewayClientScopes: ["operator.write"] })).text).toBe("a: authorized");
+  });
+});
+
+describe("openclaw ahp login with no Gateway to return to", () => {
+  /** commander, as far as cliCommands uses it: each command's action, by path. */
+  function program() {
+    const actions = new Map<string, (...args: any[]) => unknown>();
+    const command = (path: string): any => ({
+      command: (name: string) => command(`${path} ${name}`.trim()),
+      description: function () { return this; },
+      argument: function () { return this; },
+      action: function (handler: (...args: any[]) => unknown) { actions.set(path, handler); return this; },
+    });
+    return { root: command(""), actions };
+  }
+
+  test("names where the port comes from, registers no client and prints no link", async () => {
+    // A port nothing listens on.
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
+    const port = server.port;
+    server.stop(true);
+    const redirectUri = `http://127.0.0.1:${port}/ahp/oauth/callback`;
+    let prepared = 0;
+    const logins = { redirectUri, login: async () => { prepared += 1; return { type: "pending", url: "https://as.example/authorize?state=s", expiresAt: Date.now() + 60_000 }; }, waiting: async () => [{ id: "a" }] };
+    const { root, actions } = program();
+    cliCommands(root, () => logins as never, () => [{ id: "a" }]);
+    const printed: string[] = [];
+    const log = console.log, exitCode = globalThis.process.exitCode;
+    console.log = (...args: unknown[]) => { printed.push(args.join(" ")); };
+    try {
+      await actions.get("ahp login")!("a");
+      expect(globalThis.process.exitCode).toBe(1);
+    } finally {
+      console.log = log;
+      globalThis.process.exitCode = exitCode;
+    }
+    expect(prepared).toBe(0);
+    expect(printed).toHaveLength(1);
+    expect(printed[0]).toContain(`No Gateway answers at http://127.0.0.1:${port}`);
+    for (const name of ["OPENCLAW_GATEWAY_PORT", "gateway.port", "publicUrl"]) expect(printed[0]).toContain(name);
+    expect(printed.join("\n")).not.toContain("/authorize");
+    expect(await gatewayStopped({ redirectUri })).toBe(printed[0]);
   });
 });

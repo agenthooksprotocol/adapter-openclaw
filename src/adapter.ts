@@ -140,7 +140,7 @@ export class Adapter {
         // The SDK tries a backend skipped for want of a login again once a sign-in for it
         // is prepared in this process.
         if (issue.recovery === "login") {
-          this.#logins?.needsLogin(issue.backendId, issue.requiredScopes);
+          void this.#logins?.needsLogin(issue.backendId, issue.requiredScopes);
           this.#logins?.initializationFailed.add(issue.backendId);
         }
       }
@@ -167,9 +167,13 @@ export class Adapter {
       const { state } = this.api.runtime;
       const records = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth", retention: "retained" }) as unknown as KeyedStore<StoredRecord>;
       const leases = state.openKeyedStore<string>({ namespace: "ahp-oauth-leases", maxEntries: 10_000 }) as unknown as KeyedStore<string>;
+      // Retained state takes no TTL: pending logins expire here, each with its login.
+      const pending = state.openKeyedStore<StoredRecord>({ namespace: "ahp-oauth-pending", maxEntries: 10_000 }) as unknown as KeyedStore<StoredRecord>;
+      const stepUps = state.openKeyedStore<string>({ namespace: "ahp-oauth-step-up", retention: "retained" }) as unknown as KeyedStore<string>;
       const directory = join(stateDir(environment) ?? state.resolveStateDir(), "plugins", PLUGIN_ID, "oauth-secrets");
       const logins = new Logins({
-        store: keyedTokenStore(records, leases, { warn: (text) => this.warn(text) }),
+        store: keyedTokenStore(records, leases, { pending, warn: (text) => this.warn(text) }),
+        stepUps,
         secrets: Logins.secrets(fileSecretStore(directory), settings, environment),
         settings,
         environment,
@@ -342,7 +346,7 @@ export class Adapter {
     for (const diagnostic of result.diagnostics) {
       const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}${diagnostic.auth ? ` (${diagnostic.auth.code})` : ""}`;
       // Shown at the next turn's start: a delivery never starts a login itself.
-      if (diagnostic.auth?.recovery === "login") this.#logins?.needsLogin(diagnostic.backendId, diagnostic.auth.requiredScopes);
+      if (diagnostic.auth?.recovery === "login") void this.#logins?.needsLogin(diagnostic.backendId, diagnostic.auth.requiredScopes);
       if (diagnostic.syntheticDenial) this.warn(`${line} (denied by failure policy)`);
       else this.log(line);
     }

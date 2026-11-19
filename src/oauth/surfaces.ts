@@ -46,9 +46,11 @@ export function describeStatus(status: Status, withLink: boolean): string {
     case "bearer": return "bearer token";
     case "not-configured": return "no OAuth";
     case "failing": return `failing: ${status.reason}`;
-    case "needs-login":
-      if (!status.url) return "needs-login";
-      return withLink ? `needs-login: ${status.url} (valid until ${new Date(status.expiresAt!).toISOString()})` : "needs-login (run `openclaw ahp login` on the Gateway's host)";
+    case "needs-login": {
+      const label = status.scopes?.length ? `needs-login for ${status.scopes.join(" ")}` : "needs-login";
+      if (!status.url) return label;
+      return withLink ? `${label}: ${status.url} (valid until ${new Date(status.expiresAt!).toISOString()})` : `${label} (run \`openclaw ahp login\` on the Gateway's host)`;
+    }
   }
 }
 
@@ -101,13 +103,20 @@ export function cliCommands(program: Command, logins: () => Logins, backends: ()
   const ahp = program.command("ahp").description("Agent Hooks Protocol: backend sign-in");
   ahp.command("status").description("How each backend in hooks.json authenticates").action(async () => {
     const current = logins();
-    await warnIfStopped(current);
+    const stopped = await gatewayStopped(current);
+    if (stopped) console.log(stopped);
     console.log(await statusLines(current, backends(), true));
   });
   ahp.command("login").argument("[backend]", "a backend id; without one, every backend that needs it")
     .description("Sign in to a backend, in a browser").action(async (id?: string) => {
       const current = logins();
-      await warnIfStopped(current);
+      // A link would return to nothing: no client is registered and none is printed.
+      const stopped = await gatewayStopped(current);
+      if (stopped) {
+        console.log(stopped);
+        process.exitCode = 1;
+        return;
+      }
       const targets = id ? [{ id }] : await current.waiting();
       if (!targets.length) return console.log("No backend needs a sign-in.");
       let failed = false;
@@ -144,11 +153,11 @@ export async function gatewayRunning(redirectUri: string, timeoutMs = 2000): Pro
   }
 }
 
-/** For `openclaw ahp`: a link returns to the Gateway, at the port config names. */
-async function warnIfStopped(logins: Logins): Promise<void> {
-  if (!(await gatewayRunning(logins.redirectUri))) {
-    console.log(`The Gateway is not running at ${new URL(logins.redirectUri).origin}: a sign-in link returns there, so start the Gateway (or finish with \`openclaw ahp complete <url>\`).`);
-  }
+/** For `openclaw ahp`: a link returns to the Gateway, where config says it is. Why
+ * not, when nothing answers there. */
+export async function gatewayStopped(logins: Pick<Logins, "redirectUri">, timeoutMs?: number): Promise<string | undefined> {
+  if (await gatewayRunning(logins.redirectUri, timeoutMs)) return undefined;
+  return `No Gateway answers at ${new URL(logins.redirectUri).origin}, where a sign-in returns. Start the Gateway, or if it runs elsewhere, set OPENCLAW_GATEWAY_PORT or gateway.port to its port (or publicUrl to the address a browser reaches it at), then run this again.`;
 }
 
 /** Until the Gateway (or a pasted address, on a terminal) completes the login. */
